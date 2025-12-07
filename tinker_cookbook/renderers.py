@@ -477,7 +477,8 @@ class Qwen3Renderer(Renderer):
         ac_content = message["content"]
         if message["role"] == "assistant" and "</think>" in ac_content:
             # Multi-turn conversation, we remove the thinking section from the assistant message
-            ac_content = ac_content.split("</think>")[1].lstrip()
+            # ac_content = ac_content.split("</think>")[1].lstrip()
+            pass
         elif message["role"] == "assistant" and "<think>" not in ac_content:
             # Matching the paper, we force the assistant to start with <think>. Some SFT datasets include
             # <think> in the assistant messages, we so don't need to re-add it in those cases.

@@ -15,15 +15,15 @@ The expected format for each line in the JSON file is:
 
 Example usage:
     python -m tinker_cookbook.recipes.distillation.off_policy_reasoning_custom_data \
-        dataset_path=/path/to/your/data.json \
-        --max_prompts=1408 \
+        dataset_path=/home/devvrit03/filtered_openthoughts3.jsonl \
+        max_prompts=128 \
         model_name=Qwen/Qwen3-8B-Base \
         learning_rate=1e-3 \
         batch_size=128 \
         lora_rank=128 \
-        --eval_aime24 \
-        --eval_aime25 \
-        wandb_project=cookbook_sft
+        eval_aime24=True \
+        eval_aime25=True \
+        wandb_project=sft
 """
 
 import asyncio
@@ -60,7 +60,6 @@ logger = logging.getLogger(__name__)
 
 # os.environ['WANDB_API_KEY'] = <your_key>
 # os.environ['TINKER_API_KEY'] = <your_key>
-
 
 @chz.chz
 class CustomJSONBuilder(ChatDatasetBuilder):
@@ -243,6 +242,7 @@ def cli_main(cli_config: CLIConfig):
                 temperature=0.6,
                 max_tokens=16384,
                 n_samples=4,
+                renderer_name=renderer_name,
             )
         )
 
@@ -254,6 +254,7 @@ def cli_main(cli_config: CLIConfig):
                 temperature=0.6,
                 max_tokens=16384,
                 n_samples=4,
+                renderer_name=renderer_name,
             )
         )
 
@@ -275,7 +276,6 @@ def cli_main(cli_config: CLIConfig):
         save_every=cli_config.save_every,
         eval_every=cli_config.eval_every,
         infrequent_eval_every=cli_config.infrequent_eval_every,
-        # max_steps=cli_config.max_steps,
     )
 
     # Run training

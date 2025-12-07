@@ -4,6 +4,7 @@ import tinker
 from datasets import load_dataset
 from tinker.types import ModelInput, SamplingParams
 from tinker_cookbook.eval.evaluators import SamplingClientEvaluator
+from tinker_cookbook import renderers
 from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed, grade_answer
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -18,6 +19,7 @@ class RLMathEvaluatorBuilder:
     temperature: float = 0.6
     max_tokens: int = 16384
     model_name: str = "Qwen/Qwen3-8B-Base" # Needed for tokenizer
+    renderer_name: str | None = None
     
     def __call__(self) -> SamplingClientEvaluator:
         return RLMathEvaluator(self)
@@ -32,6 +34,14 @@ class RLMathEvaluator(SamplingClientEvaluator):
         
         # Initialize tokenizer
         self.tokenizer = get_tokenizer(self.config.model_name)
+        
+        # Initialize renderer if provided, or try to infer/default
+        if self.config.renderer_name:
+            self.renderer = renderers.get_renderer(self.config.renderer_name, self.tokenizer)
+        else:
+            # Fallback or default behavior if needed, though explicit is better
+            # For now let's assume if not provided we don't use stop tokens (backward compatibility)
+            raise ValueError("Renderer name must be provided")
             
     async def __call__(self, sampling_client: tinker.SamplingClient) -> dict[str, float]:
         logger.info(f"Starting evaluation on {self.config.dataset_name} with {len(self.dataset)} samples")
@@ -58,9 +68,12 @@ class RLMathEvaluator(SamplingClientEvaluator):
         # Generate samples
         import math
         
+        stop_sequences = self.renderer.get_stop_sequences() if self.renderer else None
+        
         sampling_params = SamplingParams(
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
+            stop=stop_sequences,
         )
         # Let's rewrite the loop to use asyncio.gather
         import asyncio
@@ -72,11 +85,13 @@ class RLMathEvaluator(SamplingClientEvaluator):
                 num_samples=self.config.n_samples,
                 sampling_params=sampling_params
             )
-            return idx, resp
+            return idx, resp, prompt_inp
 
         all_futures = []
         for i, prompt_text in enumerate(prompts):
-            inp = ModelInput.from_ints(self.tokenizer.encode(prompt_text))
+            inp = self.renderer.build_generation_prompt(
+                [renderers.Message(role="user", content=prompt_text)]
+            )
             all_futures.append(sample_with_index(i, inp))
             
         # Run all generations (tinker client handles concurrency/batching internally)
@@ -95,9 +110,11 @@ class RLMathEvaluator(SamplingClientEvaluator):
         from tqdm import tqdm
         
         pbar = tqdm(total=len(all_futures), desc=f"Evaluating {self.config.dataset_name}")
+        iterations = 0
         for future in tqdm_asyncio.as_completed(all_futures):
-            i, resp = await future
+            i, resp, prompt_inp = await future
             pbar.update(1)
+            iterations += 1
             
             ref = references[i]
             sequences = resp.sequences
@@ -105,21 +122,36 @@ class RLMathEvaluator(SamplingClientEvaluator):
             # Grade each sample for this prompt
             correct_count = 0
             for seq_idx, seq in enumerate(sequences):
-                decoded_text = self.tokenizer.decode(seq.tokens)
+                response = self.renderer.parse_response(seq.tokens)[0]
+                decoded_text = response["content"]
+                
+                # Log first few samples for debugging (with special tokens visible)
+                # This is OUTSIDE the try block so it always runs
+                if iterations <= 3 and seq_idx == 0:
+                    # Decode input prompt with special tokens
+                    prompt_with_special = self.tokenizer.decode(prompt_inp.to_ints(), skip_special_tokens=False)
+                    # Decode output with special tokens
+                    output_with_special = self.tokenizer.decode(seq.tokens, skip_special_tokens=False)
+                    # print("Logging")
+                    logger.info(f"\n{'='*80}")
+                    logger.info(f"Sample {i} (Input with special tokens):\n{prompt_with_special}")
+                    logger.info(f"Sample {i} (Output with special tokens):\n{output_with_special}")
+                
                 try:
                     extracted = extract_boxed(decoded_text)
                     is_correct = grade_answer(extracted, ref)
                     if is_correct:
                         correct_count += 1
                     
-                    # Log first few samples for debugging
-                    if i < 3 and seq_idx == 0:
-                        logger.info(f"\nSample {i} (Problem): {prompts[i][:100]}...")
-                        logger.info(f"Sample {i} (Gen): {decoded_text[:200]}...")
+                    # Also log grading result for first few samples
+                    if iterations <= 3 and seq_idx == 0:
                         logger.info(f"Sample {i} (Extracted): {extracted}, Ref: {ref}, Correct: {is_correct}")
+                        logger.info(f"{'='*80}")
                         
                 except Exception:
-                    pass
+                    if iterations <= 3 and seq_idx == 0:
+                        logger.info(f"Sample {i}: Failed to extract/grade answer")
+                        logger.info(f"{'='*80}")
             
             n = len(sequences)
             c = correct_count

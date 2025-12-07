@@ -35,6 +35,8 @@ from tinker_cookbook.supervised.types import (
     SupervisedDataset,
 )
 
+from tinker_cookbook.recipes.distillation.rl_math_evaluator import RLMathEvaluatorBuilder
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,13 +44,14 @@ logger = logging.getLogger(__name__)
 class OpenThoughts3Builder(ChatDatasetBuilder):
     """Builder for OpenThoughts3 dataset with streaming support."""
 
-    buffer_size: int = 128 * 3000  # Buffer for shuffle
-    max_prompts: int = 128 * 3000  # Maximum number of prompts to train on
+    buffer_size: int = 128 * 1001  # Buffer for shuffle
+    max_prompts: int = 128 * 1001  # Maximum number of prompts to train on
 
     def __call__(self) -> tuple[SupervisedDataset, SupervisedDataset | None]:
         # Load streaming dataset
         ds = datasets.load_dataset(
             "open-thoughts/OpenThoughts3-1.2M", split="train", streaming=True
+            # "open-thoughts/OpenThoughts2-1M", split="train", streaming=True
         )
         ds = cast(datasets.IterableDataset, ds)
 
@@ -103,8 +106,8 @@ class CLIConfig:
     max_length: int = 16384
 
     # Dataset configuration
-    buffer_size: int = 128 * 3000  # Buffer for randomized shuffle
-    max_prompts: int = 128 * 3000  # Maximum number of prompts to train on
+    buffer_size: int = 128 * 1001  # Buffer for randomized shuffle
+    max_prompts: int = 128 * 1001  # Maximum number of prompts to train on
 
     # Logging configuration
     log_path: str | None = None
@@ -112,8 +115,12 @@ class CLIConfig:
     wandb_name: str | None = None
 
     # Evaluation and checkpointing
-    eval_every: int = 50
-    save_every: int = 50
+    # Evaluation and checkpointing
+    eval_every: int = 500
+    save_every: int = 500
+    infrequent_eval_every: int = 500
+    eval_aime24: bool = False
+    eval_aime25: bool = False
 
     # Service configuration
     base_url: str | None = None
@@ -165,6 +172,31 @@ def cli_main(cli_config: CLIConfig):
         max_prompts=cli_config.max_prompts,
     )
 
+    infrequent_evaluator_builders = []
+    if cli_config.eval_aime24:
+        infrequent_evaluator_builders.append(
+            RLMathEvaluatorBuilder(
+                dataset_name="Maxwell-Jia/AIME_2024",
+                split="train", # AIME 2024 usually only has train split in this dataset
+                temperature=0.6,
+                max_tokens=16384,
+                n_samples=4,
+                renderer_name=renderer_name,
+            )
+        )
+
+    if cli_config.eval_aime25:
+        infrequent_evaluator_builders.append(
+            RLMathEvaluatorBuilder(
+                dataset_name="math-ai/aime25",
+                split="test", # AIME 2025 uses test split
+                temperature=0.6,
+                max_tokens=16384,
+                n_samples=4,
+                renderer_name=renderer_name,
+            )
+        )
+
     # Create full config
     config = train.Config(
         log_path=log_path,
@@ -172,7 +204,7 @@ def cli_main(cli_config: CLIConfig):
         load_checkpoint_path=cli_config.load_checkpoint_path,
         dataset_builder=dataset_builder,
         evaluator_builders=[],
-        infrequent_evaluator_builders=[],
+        infrequent_evaluator_builders=infrequent_evaluator_builders,
         learning_rate=cli_config.learning_rate,
         lr_schedule=cli_config.lr_schedule,
         num_epochs=cli_config.num_epochs,
@@ -182,6 +214,7 @@ def cli_main(cli_config: CLIConfig):
         lora_rank=cli_config.lora_rank,
         save_every=cli_config.save_every,
         eval_every=cli_config.eval_every,
+        infrequent_eval_every=cli_config.infrequent_eval_every,
     )
 
     # Run training
