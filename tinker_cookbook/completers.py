@@ -32,8 +32,16 @@ class TokensWithLogprobs:
 
 class TokenCompleter:
     async def __call__(
-        self, model_input: tinker.ModelInput, stop: StopCondition
+        self, model_input: tinker.ModelInput, stop: StopCondition, max_tokens: int | None = None
     ) -> TokensWithLogprobs:
+        """
+        Sample tokens from the model.
+        
+        Args:
+            model_input: The input to the model
+            stop: Stop condition (tokens or strings)
+            max_tokens: Optional override for max tokens. If None, uses the completer's default.
+        """
         raise NotImplementedError
 
 
@@ -57,16 +65,19 @@ class TinkerTokenCompleter(TokenCompleter):
     temperature: float = 1.0
 
     async def __call__(
-        self, model_input: tinker.ModelInput, stop: StopCondition
+        self, model_input: tinker.ModelInput, stop: StopCondition, max_tokens: int | None = None
     ) -> TokensWithLogprobs:
         """Sample an action from the policy given an observation."""
+        # Use per-call max_tokens if provided, otherwise use default
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        
         # Sample from the model
         sample_result = await self.sampling_client.sample_async(
             prompt=model_input,
             num_samples=1,
             sampling_params=tinker.SamplingParams(
                 stop=stop,
-                max_tokens=self.max_tokens,
+                max_tokens=effective_max_tokens,
                 temperature=self.temperature,
             ),
         )

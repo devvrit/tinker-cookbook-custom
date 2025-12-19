@@ -30,6 +30,7 @@ from tinker_cookbook.distillation.feedback_self_distillation_datasets import (
     DEFAULT_STUDENT_SUFFIX,
     DEFAULT_FEEDBACK_PROMPT_TEMPLATE,
     DEFAULT_PROXY_TEACHER_TEMPLATE,
+    DEFAULT_THINK_CONTINUATION_TEXT,
 )
 from tinker_cookbook.recipes.distillation.rl_math_evaluator import RLMathEvaluatorBuilder
 
@@ -59,7 +60,9 @@ class CLIConfig:
 
     # Training hyperparameters
     learning_rate: float = 1e-5
-    max_tokens: int = 16384
+    max_tokens: int = 16384  # Default max_tokens (used if turn-specific values are None)
+    max_tokens_turn1: int | None = None  # Max tokens for thinking phase; None uses max_tokens
+    max_tokens_turn2: int | None = None  # Max tokens for answer phase; None uses max_tokens
     temperature: float = 1.0
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
@@ -128,6 +131,8 @@ async def cli_main(cli_config: CLIConfig):
         student_prompt_suffix=cli_config.student_prompt_suffix,
         feedback_prompt_template=cli_config.feedback_prompt_template,
         proxy_teacher_template=cli_config.proxy_teacher_template,
+        max_tokens_turn1=cli_config.max_tokens_turn1,
+        max_tokens_turn2=cli_config.max_tokens_turn2,
         seed=cli_config.seed,
     )
 
@@ -139,7 +144,11 @@ async def cli_main(cli_config: CLIConfig):
                 dataset_name="Maxwell-Jia/AIME_2024",
                 split="train",
                 temperature=0.6,
-                max_tokens=16384,
+                max_tokens=cli_config.max_tokens,
+                use_two_step_generation=True,
+                max_tokens_turn1=cli_config.max_tokens_turn1,
+                max_tokens_turn2=cli_config.max_tokens_turn2,
+                think_continuation_text=DEFAULT_THINK_CONTINUATION_TEXT,
                 n_samples=4,
                 renderer_name=renderer_name,
                 model_name=cli_config.model_name,
@@ -152,7 +161,11 @@ async def cli_main(cli_config: CLIConfig):
                 dataset_name="math-ai/aime25",
                 split="test",
                 temperature=0.6,
-                max_tokens=16384,
+                max_tokens=cli_config.max_tokens,
+                use_two_step_generation=True,
+                max_tokens_turn1=cli_config.max_tokens_turn1,
+                max_tokens_turn2=cli_config.max_tokens_turn2,
+                think_continuation_text=DEFAULT_THINK_CONTINUATION_TEXT,
                 n_samples=4,
                 renderer_name=renderer_name,
                 model_name=cli_config.model_name,

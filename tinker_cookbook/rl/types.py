@@ -24,6 +24,7 @@ class StepResult:
     next_observation: Observation
     next_stop_condition: StopCondition
     metrics: Metrics = field(default_factory=dict)
+    next_max_tokens: int | None = None  # If set, overrides policy default for next turn
 
 
 @dataclass
@@ -48,6 +49,14 @@ class Env(ABC):
     @abstractmethod
     async def step(self, action: Action) -> StepResult:
         pass
+
+    def get_initial_max_tokens(self) -> int | None:
+        """
+        Optional: return the max_tokens for the first turn.
+        If None, uses the policy's default max_tokens.
+        Override this in subclasses to set per-turn limits.
+        """
+        return None
 
 
 @dataclass(frozen=True)

@@ -87,17 +87,29 @@ async def generate_feedback_for_group(
         Generated feedback text
     """
     # Extract summaries from each trajectory
+    # With two-step generation:
+    #   - Turn 1 (transitions[0]): thinking tokens (up to </think>)
+    #   - Turn 2 (transitions[1]): answer tokens (the summary)
+    # 
+    # If 2 turns: turn 2 IS the summary by design
+    # If 1 turn: extract summary using </think> parsing (legacy single-turn mode)
     summaries = []
     for i, trajectory in enumerate(trajectory_group.trajectories):
-        # Get the full response text
-        if trajectory.transitions:
-            action_tokens = trajectory.transitions[0].ac.tokens
-            response_text = tokenizer.decode(action_tokens)
-            
-            # Extract summary (content after </think>)
+        if not trajectory.transitions:
+            continue
+        
+        if len(trajectory.transitions) >= 2:
+            # Two-step generation: turn 2 is the summary
+            turn2_tokens = trajectory.transitions[1].ac.tokens
+            summary = tokenizer.decode(turn2_tokens).strip()
+        else:
+            # Single turn: extract summary after </think>
+            turn1_tokens = trajectory.transitions[0].ac.tokens
+            response_text = tokenizer.decode(turn1_tokens)
             summary = extract_summary_from_response(response_text, filter_incomplete_traces)
-            if summary is not None:
-                summaries.append(f"Student solution {i+1}: {summary}")
+        
+        if summary:
+            summaries.append(f"Student solution {i+1}: {summary}")
     
     # If no valid summaries, use a fallback
     if not summaries:
