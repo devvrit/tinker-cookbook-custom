@@ -72,6 +72,7 @@ class CLIConfig:
     feedback_max_tokens: int = 2048
     feedback_temperature: float = 0.7
     feedback_model_base_url: str | None = None  # If None, use same model
+    use_external_api: bool = True
 
     # Optimizer configuration
     num_substeps: int = 1
@@ -89,6 +90,9 @@ class CLIConfig:
     eval_aime24: bool = False
     eval_aime25: bool = False
     max_steps: int | None = None  # If None, train on full dataset
+    preview_trajectories: bool = True
+    preview_feedback: bool = True
+    preview_proxy_teacher_prompt: bool = True
 
     # Service configuration
     base_url: str | None = None
@@ -199,6 +203,10 @@ async def cli_main(cli_config: CLIConfig):
         infrequent_eval_every=cli_config.infrequent_eval_every,
         infrequent_evaluator_builders=infrequent_evaluator_builders,
         max_steps=cli_config.max_steps,
+        use_external_api=cli_config.use_external_api,
+        preview_trajectories=cli_config.preview_trajectories,
+        preview_feedback=cli_config.preview_feedback,
+        preview_proxy_teacher_prompt=cli_config.preview_proxy_teacher_prompt,
     )
 
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)

@@ -25,7 +25,7 @@ from tinker_cookbook.rl.types import (
     StepResult,
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
-from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
+from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed, grade_answer
 
 
 # Default prompt templates
@@ -35,7 +35,7 @@ DEFAULT_STUDENT_SUFFIX = " Write your answer in \\boxed{} format."
 DEFAULT_THINK_CONTINUATION_TEXT = "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>"
 THINK_END_TOKEN = "</think>"
 
-DEFAULT_FEEDBACK_PROMPT_TEMPLATE = """You are analyzing student attempts at solving a math problem.
+DEFAULT_FEEDBACK_PROMPT_TEMPLATE = """You are analyzing student attempts at solving a math problem to create helpful feedback for a NEW student who will attempt this problem for the first time.
 
 Problem: {problem}
 Ground Truth Answer: {answer}
@@ -43,22 +43,29 @@ Ground Truth Answer: {answer}
 Student Summaries (their final answers after thinking):
 {summaries}
 
-Based on these attempts and the ground truth, provide feedback that:
-1. Identifies common mistakes, misconceptions, and pitfalls
-2. Highlights the correct approach
-3. Explains key steps needed to reach the solution
+First, reason through each student summary carefully. Analyze what each student did correctly and incorrectly. Consider whether different students may have taken valid alternative approaches.
 
-Do not leak the final answer in your feedback, just the feedback to guide the student on how to approach the solution. Think through, and then provide a summarized feedback now:
+Then, based on your analysis and the ground truth, create feedback specifically designed to help a NEW student who has never seen this problem before. The feedback should:
+1. Warn about common mistakes, misconceptions, and pitfalls to avoid (learned from the attempts above)
+2. Suggest effective problem-solving strategies and key concepts to consider (note: there may be multiple valid solution paths - do not assume only one correct method exists)
+3. Provide hints about important reasoning steps without giving away the solution
+
+Important guidelines:
+- Do not leak the final answer in your feedback
+- Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid
+- Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
+- Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
+
+After your reasoning, provide your final summarized feedback inside <feedback> and </feedback> tags. This feedback will be given directly to a new student, so write it in second person (e.g., "You should consider...") and make it immediately useful for someone approaching this problem fresh.
 """
 
-DEFAULT_PROXY_TEACHER_TEMPLATE = """You are solving a math problem. You have received the following feedback from reviewing multiple solution attempts:
+DEFAULT_PROXY_TEACHER_TEMPLATE = """You are solving a math problem.
+Problem: {problem}
 
+You have received the following feedback from reviewing multiple solution attempts:
 Feedback: {feedback}
 
-Now solve the following problem step by step:
-{problem}
-
-Write your answer in \\boxed{{}} format.
+Now solve the problem step by step and write your answer in \\boxed{{}} format.
 """
 
 
@@ -199,8 +206,12 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
             return False
 
     def check_answer(self, sample_str: str) -> bool:
-        """Not used for self-distillation - always return False."""
-        return False
+        """Check if the extracted answer matches the ground truth."""
+        try:
+            extracted = extract_boxed(sample_str)
+            return grade_answer(extracted, self.answer)
+        except (ValueError, Exception):
+            return False
 
     def get_reference_answer(self) -> str:
         """Return the reference answer for logging purposes."""
@@ -265,13 +276,23 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
                 )
         else:
             # Step 2: Answer generation complete
-            logger.debug(f"Step 2 complete with {len(action)} additional tokens")
+            # Compute correctness metrics for logging (not used for training - KL is the signal)
+            answer_text = response_text.strip()
+            correct_format = float(self.check_format(answer_text))
+            correct_answer = float(self.check_answer(answer_text))
+            # Compute reward for logging purposes (training uses KL advantages instead)
+            total_reward = self.format_coef * (correct_format - 1) + correct_answer
+            
+            logger.debug(f"Step 2 complete with {len(action)} additional tokens, correct={correct_answer}, format={correct_format}")
             return StepResult(
-                reward=0.0,
+                reward=total_reward,
                 episode_done=True,
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self._get_step2_stop_condition(),
-                metrics={},
+                metrics={
+                    "correct": correct_answer,
+                    "format": correct_format,
+                },
             )
 
 

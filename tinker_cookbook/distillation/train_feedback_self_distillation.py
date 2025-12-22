@@ -12,6 +12,7 @@ The key difference from standard self-distillation:
 import asyncio
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, List, Sequence, cast
 
@@ -22,7 +23,7 @@ import torch
 from tinker.types import LossFnType
 
 from tinker_cookbook import checkpoint_utils
-from tinker_cookbook.display import colorize_example
+from tinker_cookbook.display import colorize_example, format_trajectory, format_text
 from tinker_cookbook.distillation.feedback_self_distillation_datasets import (
     FeedbackSelfDistillationDataset,
     FeedbackSelfDistillationDatasetBuilder,
@@ -51,6 +52,7 @@ from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.misc_utils import safezip, timed
 from tinker_cookbook.utils.trace import scope, update_scope_context, trace_init
 from tinker_cookbook import renderers
+from tinker_cookbook.utils.external_feedback import get_external_feedback, extract_external_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +67,8 @@ async def generate_feedback_for_group(
     filter_incomplete_traces: bool,
     feedback_max_tokens: int,
     feedback_temperature: float,
-) -> str:
+    use_external_api: bool = False,
+) -> str | None:
     """
     Generate feedback for a group of rollouts.
     
@@ -84,7 +87,7 @@ async def generate_feedback_for_group(
         feedback_temperature: Temperature for feedback generation
         
     Returns:
-        Generated feedback text
+        Generated feedback text, or None if feedback extraction failed
     """
     # Extract summaries from each trajectory
     # With two-step generation:
@@ -94,18 +97,18 @@ async def generate_feedback_for_group(
     # If 2 turns: turn 2 IS the summary by design
     # If 1 turn: extract summary using </think> parsing (legacy single-turn mode)
     summaries = []
-    for i, trajectory in enumerate(trajectory_group.trajectories):
+    for i, trajectory in enumerate(trajectory_group.trajectories_G):
         if not trajectory.transitions:
             continue
         
         if len(trajectory.transitions) >= 2:
             # Two-step generation: turn 2 is the summary
             turn2_tokens = trajectory.transitions[1].ac.tokens
-            summary = tokenizer.decode(turn2_tokens).strip()
+            summary = tokenizer.decode(turn2_tokens, skip_special_tokens=True).strip()
         else:
             # Single turn: extract summary after </think>
             turn1_tokens = trajectory.transitions[0].ac.tokens
-            response_text = tokenizer.decode(turn1_tokens)
+            response_text = tokenizer.decode(turn1_tokens, skip_special_tokens=True)
             summary = extract_summary_from_response(response_text, filter_incomplete_traces)
         
         if summary:
@@ -119,29 +122,37 @@ async def generate_feedback_for_group(
     
     # Get feedback prompt from the first env (all share same problem/answer)
     feedback_prompt = envs[0].get_feedback_prompt(summaries_text)
-    
-    # Build generation prompt for feedback
-    feedback_convo = (envs[0].convo_prefix or []) + [
-        {"role": "user", "content": feedback_prompt},
-    ]
-    feedback_input = renderer.build_generation_prompt(feedback_convo)
-    
-    # Generate feedback
-    feedback_response = await sampling_client.sample_async(
-        feedback_input,
-        max_tokens=feedback_max_tokens,
-        temperature=feedback_temperature,
-        stop_sequences=renderer.get_stop_sequences(),
-    )
-    
-    # Decode feedback
-    feedback_text = tokenizer.decode(feedback_response.tokens)
-    
-    # Parse to remove stop tokens if present
-    feedback_message, _ = renderer.parse_response(feedback_response.tokens)
-    feedback_text = feedback_message["content"]
-    feedback_text = extract_summary_from_response(feedback_text, filter_incomplete_traces)
-    
+
+    if use_external_api:
+        feedback_text = await get_external_feedback(feedback_prompt)
+        feedback_text = extract_external_feedback(feedback_text, start_tag = "<feedback>", end_tag = "</feedback>")
+        # logger.info(f"External feedback: {feedback_text}")
+    else:
+        # Build generation prompt for feedback
+        feedback_convo = (envs[0].convo_prefix or []) + [
+            {"role": "user", "content": feedback_prompt},
+        ]
+        
+
+        feedback_input = renderer.build_generation_prompt(feedback_convo)
+
+        # logger.info(f"Feedback input: {feedback_convo[-1]['content']}")
+        # Generate feedback
+        feedback_response = await sampling_client.sample_async(
+            prompt=feedback_input,
+            num_samples=1,
+            sampling_params=tinker.SamplingParams(
+                max_tokens=feedback_max_tokens,
+                temperature=feedback_temperature,
+                stop=renderer.get_stop_sequences(),
+            ),
+        )
+        
+        # Decode feedback
+        feedback_tokens = feedback_response.sequences[0].tokens
+        feedback_message, _ = renderer.parse_response(feedback_tokens)
+        parsed_feedback_text = feedback_message["content"]
+        feedback_text = extract_summary_from_response(parsed_feedback_text, filter_incomplete_traces)    
     return feedback_text
 
 
@@ -155,6 +166,7 @@ async def incorporate_feedback_self_distillation_kl(
     renderer: renderers.Renderer,
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    preview_proxy_teacher_prompt: bool = True,
 ) -> Dict[str, float]:
     """
     Compute reverse KL between student and proxy teacher (conditioned on generated feedback).
@@ -184,6 +196,10 @@ async def incorporate_feedback_self_distillation_kl(
         
         # Build the proxy teacher prompt input (conditioned on feedback)
         proxy_prompt = env.get_proxy_teacher_prompt()
+
+        if i == 0:
+            logger.info(f"Proxy teacher prompt: {format_text(proxy_prompt, preview_proxy_teacher_prompt)}")
+
         proxy_convo = (env.convo_prefix or []) + [
             {"role": "user", "content": proxy_prompt},
         ]
@@ -285,10 +301,14 @@ class Config:
 
     wandb_project: str | None = None
     wandb_name: str | None = None
+    use_external_api: bool = False
 
     log_path: str = chz.field(munger=lambda _, s: os.path.expanduser(s))
     base_url: str | None = None
     enable_trace: bool = False
+    preview_trajectories: bool = False
+    preview_feedback: bool = False
+    preview_proxy_teacher_prompt: bool = False
 
     eval_every: int = 50
     save_every: int = 50
@@ -309,6 +329,7 @@ async def prepare_minibatch(
     renderer: renderers.Renderer,
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    preview_proxy_teacher_prompt: bool = False,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
     """Converts the trajectories into a minibatch with feedback-based KL as advantage."""
 
@@ -336,6 +357,7 @@ async def prepare_minibatch(
             renderer,
             kl_penalty_coef,
             kl_discount_factor,
+            preview_proxy_teacher_prompt=preview_proxy_teacher_prompt,
         )
     metrics.update(kl_metrics)
 
@@ -366,6 +388,7 @@ async def do_train_step_and_get_sampling_client(
         renderer,
         kl_penalty_coef=cfg.kl_penalty_coef,
         kl_discount_factor=cfg.kl_discount_factor,
+        preview_proxy_teacher_prompt=cfg.preview_proxy_teacher_prompt,
     )
     metrics.update(prepare_minibatch_metrics)
 
@@ -385,7 +408,7 @@ async def do_train_step_and_get_sampling_client(
         training_logprobs_D,
         cfg.log_path,
         cfg.save_every,
-        compute_post_kl=False,
+        do_compute_post_kl=False,
     )
     metrics.update(full_batch_metrics)
 
@@ -444,31 +467,53 @@ async def do_sync_training(
         env_group_builders_P = dataset.get_batch(i_batch)
         
         # Phase 1: Sample trajectories AND keep track of envs
+        # Note: We need envs for feedback generation, so we create them here
+        # and also sample trajectories in parallel
+        async def _sample_one_group(
+            builder: EnvGroupBuilder,
+        ) -> tuple[Sequence[FeedbackSelfDistillationEnv], TrajectoryGroup | None, EnvGroupBuilder]:
+            """Sample trajectories for one group, returning envs and trajectory group."""
+            envs = await builder.make_envs()
+            envs = cast(Sequence[FeedbackSelfDistillationEnv], envs)
+            
+            trajectory_group = await do_group_rollout_and_filter_constant_reward(
+                sampling_client,
+                builder,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                do_remove_constant_reward_groups=False,
+            )
+            
+            return (envs, trajectory_group, builder)
+        
+        with timed("sample", metrics):
+            results = await asyncio.gather(
+                *[
+                    asyncio.create_task(
+                        _sample_one_group(builder),
+                        name=f"sample_task_{i}",
+                    )
+                    for i, builder in enumerate(env_group_builders_P)
+                ],
+            )
+        # Filter out groups with None trajectory
         env_groups_P: list[Sequence[FeedbackSelfDistillationEnv]] = []
         trajectory_groups_P: list[TrajectoryGroup] = []
         valid_env_group_builders_P: list[EnvGroupBuilder] = []
-        
-        with timed("sample", metrics):
-            for builder in env_group_builders_P:
-                # Create envs and sample trajectories
-                envs = await builder.make_envs()
-                envs = cast(Sequence[FeedbackSelfDistillationEnv], envs)
-                
-                trajectory_group = await do_group_rollout_and_filter_constant_reward(
-                    sampling_client,
-                    builder,
-                    temperature=cfg.temperature,
-                    max_tokens=cfg.max_tokens,
-                    do_remove_constant_reward_groups=False,
-                )
-                if trajectory_group is not None:
-                    env_groups_P.append(envs)
-                    trajectory_groups_P.append(trajectory_group)
-                    valid_env_group_builders_P.append(builder)
+        for envs, trajectory_group, builder in results:
+            if trajectory_group is not None:
+                env_groups_P.append(envs)
+                trajectory_groups_P.append(trajectory_group)
+                valid_env_group_builders_P.append(builder)
 
         if not trajectory_groups_P:
             logger.warning(f"No valid trajectory groups for batch {i_batch}")
             continue
+
+        # Log preview of first 2 trajectories
+        if trajectory_groups_P:
+            for i, trajectory in enumerate(trajectory_groups_P[0].trajectories_G[:2]):
+                logger.info(format_trajectory(trajectory, tokenizer, preview=cfg.preview_trajectories, label=f"Traj {i}"))
 
         # Phase 2: Generate feedback for each group
         with timed("generate_feedback", metrics):
@@ -483,21 +528,27 @@ async def do_sync_training(
                     cfg.filter_incomplete_traces,
                     cfg.feedback_max_tokens,
                     cfg.feedback_temperature,
+                    use_external_api=cfg.use_external_api,
                 )
                 feedback_tasks.append(task)
             
             # Generate all feedbacks in parallel
             feedbacks = await asyncio.gather(*feedback_tasks)
+
+            for idx, fb in enumerate(feedbacks[:2]):
+                logger.info(f"Feedback {idx}: {format_text(fb, cfg.preview_feedback) if fb else '(empty)'}")
             
             # Set feedback on all envs in each group
             for envs, feedback in zip(env_groups_P, feedbacks, strict=True):
                 for env in envs:
                     env.generated_feedback = feedback
-        
-        # Log feedback for first group
-        if feedbacks:
-            logger.info(f"Generated feedback (first group): {feedbacks[0]}")
-            metrics["feedback/length"] = sum(len(f) for f in feedbacks) / len(feedbacks)
+            
+            # Compute feedback metrics
+            if feedbacks:
+                # Filter out None feedbacks when computing average length
+                valid_feedbacks = [f for f in feedbacks if f is not None]
+                if valid_feedbacks:
+                    metrics["feedback/length"] = sum(len(f) for f in valid_feedbacks) / len(valid_feedbacks)
 
         # Phase 3: Train step (now envs have feedback set)
         sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
@@ -531,6 +582,18 @@ async def main(cfg: Config):
         config=cfg,
         wandb_name=cfg.wandb_name,
     )
+    
+    # Log the command used to launch this job
+    command_str = " ".join(sys.argv)
+    logger.info(f"Launch command: {command_str}")
+    
+    # Also save command to a file for easy reference
+    command_file = os.path.join(cfg.log_path, "command.txt")
+    os.makedirs(cfg.log_path, exist_ok=True)
+    with open(command_file, "w") as f:
+        f.write(command_str + "\n")
+    logger.info(f"Command saved to {command_file}")
+    
     if cfg.enable_trace:
         current_task = asyncio.current_task()
         if current_task is not None:
