@@ -482,7 +482,7 @@ class Qwen3Renderer(Renderer):
         elif message["role"] == "assistant" and "<think>" not in ac_content:
             # Matching the paper, we force the assistant to start with <think>. Some SFT datasets include
             # <think> in the assistant messages, we so don't need to re-add it in those cases.
-            ob_str += "<think>\n"
+            ob_str += "<think>"
         # Observation (prompt) part
         if "tool_calls" in message:
             ac_content += "\n".join(
