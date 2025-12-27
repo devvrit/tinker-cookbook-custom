@@ -23,6 +23,7 @@ from tinker_cookbook.rl.types import (
     StepResult,
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed, grade_answer
 
 
 @chz.chz
@@ -179,6 +180,164 @@ class PromptOnlyDataset(RLDataset):
         return math.ceil(len(self.prompts) / self.batch_size)
 
 
+# Default prompt suffix for math problems
+DEFAULT_MATH_PROMPT_SUFFIX = " Write your answer in \\boxed{} format."
+
+
+class PolarisMathEnv(ProblemEnv):
+    """
+    Environment for Polaris math problems that tracks correctness.
+    
+    Unlike PromptOnlyEnv, this environment:
+    - Has ground truth answers
+    - Checks if the model's response matches the answer
+    - Returns correctness metrics (but still zero reward - KL is the training signal)
+    """
+
+    def __init__(
+        self,
+        problem: str,
+        answer: str,
+        renderer: renderers.Renderer,
+        convo_prefix: list[renderers.Message] | None = None,
+        prompt_suffix: str = DEFAULT_MATH_PROMPT_SUFFIX,
+    ):
+        # Set format_coef to 0 since we don't use format rewards for training
+        super().__init__(renderer, convo_prefix, format_coef=0.0)
+        self.problem = problem
+        self.answer = answer
+        self.prompt_suffix = prompt_suffix
+
+    def get_question(self) -> str:
+        return self.problem + self.prompt_suffix
+
+    def check_format(self, sample_str: str) -> bool:
+        """Check if sample contains \\boxed{} format."""
+        try:
+            _ = extract_boxed(sample_str)
+            return True
+        except ValueError:
+            return False
+
+    def check_answer(self, sample_str: str) -> bool:
+        """Check if the extracted answer matches the ground truth."""
+        try:
+            extracted = extract_boxed(sample_str)
+            return grade_answer(extracted, self.answer)
+        except (ValueError, Exception):
+            return False
+
+    def get_reference_answer(self) -> str:
+        """Return the reference answer for logging purposes."""
+        return self.answer
+
+    async def step(self, action: Action) -> StepResult:
+        """
+        Return zero reward but track correctness metrics.
+        
+        Training uses KL divergence as the signal, but we log accuracy for monitoring.
+        """
+        message, parse_success = self.renderer.parse_response(action)
+        response_text = message["content"]
+        
+        correct_format = float(self.check_format(response_text))
+        correct_answer = float(self.check_answer(response_text))
+        
+        return StepResult(
+            reward=0.0,  # Zero reward - KL is the training signal
+            episode_done=True,
+            next_observation=tinker.ModelInput.empty(),
+            next_stop_condition=self.stop_condition,
+            metrics={
+                "correct": correct_answer,
+                "format": correct_format,
+            },
+        )
+
+
+class PolarisMathDataset(RLDataset):
+    """Dataset for Polaris math problems with correctness tracking."""
+
+    def __init__(
+        self,
+        problems: list[str],
+        answers: list[str],
+        batch_size: int,
+        group_size: int,
+        renderer: renderers.Renderer,
+        tokenizer,
+        convo_prefix: list[renderers.Message] | None = None,
+        prompt_suffix: str = DEFAULT_MATH_PROMPT_SUFFIX,
+        dataset_name: str = "polaris_math",
+    ):
+        assert len(problems) == len(answers), "Problems and answers must have same length"
+        self.problems = problems
+        self.answers = answers
+        self.batch_size = batch_size
+        self.group_size = group_size
+        self.renderer = renderer
+        self.tokenizer = tokenizer
+        self.convo_prefix = convo_prefix
+        self.prompt_suffix = prompt_suffix
+        self.dataset_name = dataset_name
+
+    def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
+        batch_start = index * self.batch_size
+        batch_end = min((index + 1) * self.batch_size, len(self.problems))
+        assert batch_start < batch_end, "Incorrect batch size"
+        return [
+            ProblemGroupBuilder(
+                env_thunk=partial(
+                    PolarisMathEnv,
+                    problem,
+                    answer,
+                    self.renderer,
+                    convo_prefix=self.convo_prefix,
+                    prompt_suffix=self.prompt_suffix,
+                ),
+                num_envs=self.group_size,
+                dataset_name=self.dataset_name,
+            )
+            for problem, answer in zip(
+                self.problems[batch_start:batch_end],
+                self.answers[batch_start:batch_end],
+            )
+        ]
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.problems) / self.batch_size)
+
+
+def load_polaris_problems_and_answers(
+    seed: int = 0,
+) -> tuple[list[str], list[str]] | None:
+    """
+    Load Polaris math problems and answers from HuggingFace.
+
+    Args:
+        seed: Random seed for shuffling the dataset.
+
+    Returns:
+        Tuple of (problems, answers) lists, or None if dataset cannot be loaded.
+    """
+    try:
+        ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train").shuffle(seed=seed)
+        problems = []
+        answers = []
+
+        for row in ds:  # type: ignore
+            problem = row.get("problem", "")  # type: ignore
+            answer = row.get("answer", "")  # type: ignore
+            if problem and answer:
+                problems.append(problem)
+                answers.append(answer)
+
+        return problems, answers
+    except Exception as e:
+        logger.warning(f"Could not load Polaris dataset: {e}")
+        return None
+
+
 def load_deepmath_prompts(split: Literal["train", "test"] = "train") -> list[str] | None:
     """Load DeepMath prompts from HuggingFace. Returns None if split doesn't exist."""
     try:
@@ -220,6 +379,39 @@ def load_tulu3_prompts() -> list[str] | None:
         return None
 
 
+def load_polaris_prompts(
+    seed: int = 0,
+    prompt_suffix: str = " Write your answer in \\boxed{} format.",
+) -> list[str] | None:
+    """
+    Load Polaris math problem prompts from HuggingFace.
+
+    The Polaris dataset (POLARIS-Project/Polaris-Dataset-53K) contains math problems
+    with 'problem' and 'answer' fields. We extract the 'problem' field and optionally
+    append a suffix for formatting instructions.
+
+    Args:
+        seed: Random seed for shuffling the dataset.
+        prompt_suffix: Suffix to append to each problem (e.g., formatting instructions).
+
+    Returns:
+        List of problem prompts, or None if dataset cannot be loaded.
+    """
+    try:
+        ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train").shuffle(seed=seed)
+        prompts = []
+
+        for row in ds:  # type: ignore
+            problem = row.get("problem", "")  # type: ignore
+            if problem:
+                prompts.append(problem + prompt_suffix)
+
+        return prompts
+    except Exception as e:
+        logger.warning(f"Could not load Polaris dataset: {e}")
+        return None
+
+
 @chz.chz
 class PromptOnlyDatasetBuilder(RLDatasetBuilder):
     """Builder for prompt-only datasets."""
@@ -243,6 +435,9 @@ class PromptOnlyDatasetBuilder(RLDatasetBuilder):
         elif self.dataset_name == "tulu3":
             train_prompts = load_tulu3_prompts()
             test_prompts = None  # Tulu3 only has train split
+        elif self.dataset_name == "polaris":
+            train_prompts = load_polaris_prompts()
+            test_prompts = None  # Polaris only has train split
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
@@ -276,3 +471,41 @@ class PromptOnlyDatasetBuilder(RLDatasetBuilder):
         )
 
         return train_dataset, test_dataset
+
+
+@chz.chz
+class PolarisMathDatasetBuilder(RLDatasetBuilder):
+    """Builder for Polaris math dataset with correctness tracking."""
+
+    groups_per_batch: int
+    group_size: int
+    model_name_for_tokenizer: str
+    renderer_name: str
+    convo_prefix: list[renderers.Message] | None = None
+    prompt_suffix: str = DEFAULT_MATH_PROMPT_SUFFIX
+    seed: int = 0
+
+    async def __call__(self) -> tuple[PolarisMathDataset, None]:
+        tokenizer = get_tokenizer(self.model_name_for_tokenizer)
+        renderer = renderers.get_renderer(self.renderer_name, tokenizer=tokenizer)
+
+        # Load problems and answers
+        result = load_polaris_problems_and_answers(seed=self.seed)
+        if result is None:
+            raise ValueError("Could not load Polaris dataset")
+        problems, answers = result
+
+        train_dataset = PolarisMathDataset(
+            problems=problems,
+            answers=answers,
+            batch_size=self.groups_per_batch,
+            group_size=self.group_size,
+            renderer=renderer,
+            tokenizer=tokenizer,
+            convo_prefix=self.convo_prefix,
+            prompt_suffix=self.prompt_suffix,
+            dataset_name="polaris_math",
+        )
+
+        # No test dataset for now
+        return train_dataset, None

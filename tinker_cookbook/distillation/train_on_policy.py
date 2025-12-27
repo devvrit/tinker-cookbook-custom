@@ -159,6 +159,7 @@ class Config:
     eval_every: int = 20
     save_every: int = 20
     load_checkpoint_path: str | None = None
+    max_steps: int | None = None  # If None, train on full dataset
 
 
 @scope
@@ -429,10 +430,16 @@ async def main(
     num_batches = len(composite_dataset)
     logger.info(f"Will train on {num_batches} batches")
 
+    # Compute end_batch (respect max_steps if set)
+    end_batch = num_batches
+    if cfg.max_steps is not None:
+        end_batch = min(num_batches, cfg.max_steps)
+        logger.info(f"max_steps={cfg.max_steps}, will train for {end_batch - start_batch} steps")
+
     # Training loop
     await do_sync_training(
         start_batch=start_batch,
-        end_batch=num_batches,
+        end_batch=end_batch,
         num_batches=num_batches,
         cfg=cfg,
         training_client=training_client,

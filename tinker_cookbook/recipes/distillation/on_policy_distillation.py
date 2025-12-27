@@ -35,6 +35,7 @@ from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.distillation import train_on_policy
 from tinker_cookbook.distillation.datasets import (
     DistillationDatasetConfig,
+    PolarisMathDatasetBuilder,
     PromptOnlyDatasetBuilder,
     TeacherConfig,
 )
@@ -57,7 +58,8 @@ class CLIConfig:
     teacher_checkpoint: str | None = None
 
     # Dataset configuration
-    dataset: str = "deepmath"  # Options: deepmath, tulu3
+    # Options: deepmath, tulu3, polaris (no accuracy), polaris_math (with accuracy tracking)
+    dataset: str = "deepmath"
 
     # Training hyperparameters
     group_size: int = 4  # Number of rollouts per prompt
@@ -81,6 +83,7 @@ class CLIConfig:
     # Evaluation and checkpointing
     eval_every: int = 20
     save_every: int = 20
+    max_steps: int | None = None  # If None, train on full dataset
 
     # Service configuration
     base_url: str | None = None
@@ -115,13 +118,23 @@ async def cli_main(cli_config: CLIConfig):
         wandb_name = os.path.basename(log_path)
 
     # Create dataset builder
-    dataset_builder = PromptOnlyDatasetBuilder(
-        dataset_name=cli_config.dataset,
-        groups_per_batch=cli_config.groups_per_batch,
-        group_size=cli_config.group_size,
-        model_name_for_tokenizer=cli_config.model_name,
-        renderer_name=renderer_name,
-    )
+    if cli_config.dataset == "polaris_math":
+        # Use PolarisMathDatasetBuilder for accuracy tracking
+        dataset_builder = PolarisMathDatasetBuilder(
+            groups_per_batch=cli_config.groups_per_batch,
+            group_size=cli_config.group_size,
+            model_name_for_tokenizer=cli_config.model_name,
+            renderer_name=renderer_name,
+        )
+    else:
+        # Use PromptOnlyDatasetBuilder for other datasets (no accuracy tracking)
+        dataset_builder = PromptOnlyDatasetBuilder(
+            dataset_name=cli_config.dataset,
+            groups_per_batch=cli_config.groups_per_batch,
+            group_size=cli_config.group_size,
+            model_name_for_tokenizer=cli_config.model_name,
+            renderer_name=renderer_name,
+        )
 
     # Create teacher config
     teacher_config = TeacherConfig(
@@ -155,6 +168,7 @@ async def cli_main(cli_config: CLIConfig):
         compute_post_kl=cli_config.compute_post_kl,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
+        max_steps=cli_config.max_steps,
     )
 
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
