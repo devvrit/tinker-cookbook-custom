@@ -4,10 +4,10 @@ Feedback-based on-policy self-distillation for reasoning tasks.
 This script implements self-distillation where:
 1. The student generates G rollouts per prompt
 2. A feedback model generates textual feedback based on rollout summaries + ground truth
-3. The proxy teacher is the same model conditioned on the generated feedback
+3. The proxy teacher computes logprobs (can be same model or a separate teacher model)
 4. KL divergence between student and proxy teacher provides the training signal
 
-Example usage:
+Example usage (self-distillation with same model):
     python -m tinker_cookbook.recipes.distillation.feedback_self_distillation \\
         model_name=Qwen/Qwen3-8B-Base \\
         load_checkpoint_path=/path/to/sft/checkpoint \\
@@ -15,6 +15,17 @@ Example usage:
         groups_per_batch=256 \\
         lora_rank=128 \\
         wandb_project=feedback_self_distillation
+
+Example usage (with separate teacher model for KL computation):
+    python -m tinker_cookbook.recipes.distillation.feedback_self_distillation \\
+        model_name=Qwen/Qwen3-8B-Base \\
+        teacher_model_name=Qwen/Qwen3-32B \\
+        teacher_base_url=http://localhost:8001 \\
+        load_checkpoint_path=/path/to/sft/checkpoint \\
+        learning_rate=1e-5 \\
+        groups_per_batch=256 \\
+        lora_rank=128 \\
+        wandb_project=feedback_distillation
 """
 
 import asyncio
@@ -42,7 +53,9 @@ class CLIConfig:
     """Command-line configuration for feedback-based self-distillation."""
 
     # Model configuration
-    model_name: str = "Qwen/Qwen3-8B-Base"  # Student model
+    model_name: str = "Qwen/Qwen3-8B-Base"  # Student/policy model
+    teacher_model_name: str | None = None  # Teacher model (if None, uses same as policy)
+    teacher_base_url: str | None = None  # Separate service URL for teacher model
     lora_rank: int = 128
     renderer_name: str | None = "qwen3"
     load_checkpoint_path: str | None = None  # Starting checkpoint (e.g., from SFT)
@@ -70,9 +83,10 @@ class CLIConfig:
     # Feedback generation parameters
     filter_incomplete_traces: bool = True  # Skip traces without </think> tag
     feedback_max_tokens: int = 2048
-    feedback_temperature: float = 0.7
+    feedback_temperature: float = 0.0  # Lower temperature for more deterministic, reliable feedback
     feedback_model_base_url: str | None = None  # If None, use same model
     use_external_api: bool = True
+    external_feedback_model: str = "gemini-2.0-flash-lite"
 
     # Optimizer configuration
     num_substeps: int = 1
@@ -181,6 +195,8 @@ async def cli_main(cli_config: CLIConfig):
         learning_rate=cli_config.learning_rate,
         dataset_builder=dataset_builder,
         model_name=cli_config.model_name,
+        teacher_model_name=cli_config.teacher_model_name,
+        teacher_base_url=cli_config.teacher_base_url,
         lora_rank=cli_config.lora_rank,
         max_tokens=cli_config.max_tokens,
         temperature=cli_config.temperature,
@@ -204,6 +220,7 @@ async def cli_main(cli_config: CLIConfig):
         infrequent_evaluator_builders=infrequent_evaluator_builders,
         max_steps=cli_config.max_steps,
         use_external_api=cli_config.use_external_api,
+        external_feedback_model=cli_config.external_feedback_model,
         preview_trajectories=cli_config.preview_trajectories,
         preview_feedback=cli_config.preview_feedback,
         preview_proxy_teacher_prompt=cli_config.preview_proxy_teacher_prompt,

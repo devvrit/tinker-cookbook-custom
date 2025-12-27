@@ -68,6 +68,7 @@ async def generate_feedback_for_group(
     feedback_max_tokens: int,
     feedback_temperature: float,
     use_external_api: bool = False,
+    external_feedback_model: str = "gemini-2.0-flash-lite",
 ) -> str | None:
     """
     Generate feedback for a group of rollouts.
@@ -124,7 +125,12 @@ async def generate_feedback_for_group(
     feedback_prompt = envs[0].get_feedback_prompt(summaries_text)
 
     if use_external_api:
-        feedback_text = await get_external_feedback(feedback_prompt)
+        feedback_text = await get_external_feedback(
+            feedback_prompt,
+            feedback_temperature=feedback_temperature,
+            feedback_max_tokens=feedback_max_tokens,
+            model=external_feedback_model,
+        )
         feedback_text = extract_external_feedback(feedback_text, start_tag = "<feedback>", end_tag = "</feedback>")
         # logger.info(f"External feedback: {feedback_text}")
     else:
@@ -160,6 +166,7 @@ async def generate_feedback_for_group(
 async def incorporate_feedback_self_distillation_kl(
     data_D: List[tinker.Datum],
     sampling_client: tinker.SamplingClient,
+    teacher_sampling_client: tinker.SamplingClient | None,
     trajectory_groups_P: list[TrajectoryGroup],
     env_groups_P: list[Sequence[FeedbackSelfDistillationEnv]],
     metadata_D: List[dict[str, int]],
@@ -219,9 +226,11 @@ async def incorporate_feedback_self_distillation_kl(
         proxy_teacher_sequences.append(full_sequence)
     
     # Compute proxy teacher logprobs for all sequences
+    # Use teacher client if provided, otherwise fall back to student client
+    logprob_client = teacher_sampling_client if teacher_sampling_client is not None else sampling_client
     proxy_teacher_logprobs_D = await asyncio.gather(
         *[
-            sampling_client.compute_logprobs_async(seq)
+            logprob_client.compute_logprobs_async(seq)
             for seq in proxy_teacher_sequences
         ]
     )
@@ -284,13 +293,17 @@ class Config:
     evaluator_builders: list[SamplingClientEvaluatorBuilder] = chz.field(default_factory=list)
     lora_rank: int = 32
 
+    # Teacher model configuration (for KL computation)
+    teacher_model_name: str | None = None  # If None, use same model as student
+    teacher_base_url: str | None = None  # Separate service URL for teacher model
+
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
 
     # Feedback generation parameters
     filter_incomplete_traces: bool = True
     feedback_max_tokens: int = 2048
-    feedback_temperature: float = 0.7
+    feedback_temperature: float = 0.0  # Lower temperature for more deterministic, reliable feedback
     feedback_model_base_url: str | None = None  # If None, use same model
 
     # Loss function to use for training: "importance_sampling" or "ppo"
@@ -302,6 +315,7 @@ class Config:
     wandb_project: str | None = None
     wandb_name: str | None = None
     use_external_api: bool = False
+    external_feedback_model: str = "gemini-2.0-flash-lite"  # Model to use for external feedback API
 
     log_path: str = chz.field(munger=lambda _, s: os.path.expanduser(s))
     base_url: str | None = None
@@ -325,6 +339,7 @@ async def prepare_minibatch(
     trajectory_groups_P: list[TrajectoryGroup],
     env_groups_P: list[Sequence[FeedbackSelfDistillationEnv]],
     sampling_client: tinker.SamplingClient,
+    teacher_sampling_client: tinker.SamplingClient | None,
     tokenizer: Tokenizer,
     renderer: renderers.Renderer,
     kl_penalty_coef: float,
@@ -351,6 +366,7 @@ async def prepare_minibatch(
         kl_metrics = await incorporate_feedback_self_distillation_kl(
             data_D,
             sampling_client,
+            teacher_sampling_client,
             trajectory_groups_P,
             env_groups_P,
             metadata_D,
@@ -370,6 +386,7 @@ async def do_train_step_and_get_sampling_client(
     i_batch: int,
     training_client: tinker.TrainingClient,
     sampling_client: tinker.SamplingClient,
+    teacher_sampling_client: tinker.SamplingClient | None,
     tokenizer: Tokenizer,
     renderer: renderers.Renderer,
     env_group_builders_P: Sequence[EnvGroupBuilder],
@@ -384,6 +401,7 @@ async def do_train_step_and_get_sampling_client(
         trajectory_groups_P,
         env_groups_P,
         sampling_client,
+        teacher_sampling_client,
         tokenizer,
         renderer,
         kl_penalty_coef=cfg.kl_penalty_coef,
@@ -429,6 +447,7 @@ async def do_sync_training(
     tokenizer: Tokenizer,
     renderer: renderers.Renderer,
     feedback_sampling_client: tinker.SamplingClient | None = None,
+    teacher_sampling_client: tinker.SamplingClient | None = None,
 ):
     """Implements fully synchronous feedback-based self-distillation training."""
 
@@ -457,7 +476,7 @@ async def do_sync_training(
                     metrics.update({f"test/{k}": v for k, v in eval_metrics.items()})
 
         # Run infrequent evaluations (e.g., AIME24, AIME25)
-        if cfg.infrequent_eval_every > 0 and i_batch % cfg.infrequent_eval_every == 0:
+        if cfg.infrequent_eval_every > 0 and i_batch % cfg.infrequent_eval_every == 0 and i_batch > 0:
             with timed("run_infrequent_evals", metrics):
                 for evaluator in infrequent_evaluators:
                     eval_metrics = await evaluator(sampling_client)
@@ -529,6 +548,7 @@ async def do_sync_training(
                     cfg.feedback_max_tokens,
                     cfg.feedback_temperature,
                     use_external_api=cfg.use_external_api,
+                    external_feedback_model=cfg.external_feedback_model,
                 )
                 feedback_tasks.append(task)
             
@@ -556,6 +576,7 @@ async def do_sync_training(
             i_batch,
             training_client,
             sampling_client,
+            teacher_sampling_client,
             tokenizer,
             renderer,
             valid_env_group_builders_P,
@@ -651,6 +672,16 @@ async def main(cfg: Config):
         )
         logger.info(f"Using separate feedback model at {cfg.feedback_model_base_url}")
 
+    # Create teacher sampling client if using separate teacher model for KL computation
+    teacher_sampling_client = None
+    if cfg.teacher_model_name:
+        teacher_service_client = tinker.ServiceClient(base_url=cfg.teacher_base_url)
+        teacher_sampling_client = await teacher_service_client.create_sampling_client_async(
+            base_model=cfg.teacher_model_name
+        )
+        teacher_base_url_info = cfg.teacher_base_url or "default"
+        logger.info(f"Using separate teacher model: {cfg.teacher_model_name} at {teacher_base_url_info}")
+
     # Compute end_batch (respect max_steps if set)
     end_batch = num_batches
     if cfg.max_steps is not None:
@@ -671,6 +702,7 @@ async def main(cfg: Config):
         tokenizer=tokenizer,
         renderer=renderer,
         feedback_sampling_client=feedback_sampling_client,
+        teacher_sampling_client=teacher_sampling_client,
     )
 
     # Save final checkpoint
