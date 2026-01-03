@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Two-step generation constants
 THINK_END_TOKEN = "</think>"
 DEFAULT_THINK_CONTINUATION_TEXT = "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>"
+DEFAULT_EVAL_STUDENT_SUFFIX = "\nWrite your answer in \\boxed{} format."
 
 @chz.chz
 class RLMathEvaluatorBuilder:
@@ -35,6 +36,9 @@ class RLMathEvaluatorBuilder:
     max_tokens_turn1: int | None = None  # Max tokens for thinking phase; None uses max_tokens
     max_tokens_turn2: int | None = None  # Max tokens for answer phase; None uses max_tokens
     think_continuation_text: str = DEFAULT_THINK_CONTINUATION_TEXT
+    
+    # Custom prompt suffix (allows using same prompt as training)
+    student_prompt_suffix: str = DEFAULT_EVAL_STUDENT_SUFFIX
     
     def __call__(self) -> SamplingClientEvaluator:
         return RLMathEvaluator(self)
@@ -165,7 +169,7 @@ class RLMathEvaluator(SamplingClientEvaluator):
                 logger.warning(f"Unknown sample format: {sample.keys()}")
                 continue
                 
-            prompt_text = problem + "\nWrite your answer in \\boxed{} format."
+            prompt_text = problem + self.config.student_prompt_suffix
             prompts.append(prompt_text)
             references.append(answer)
         

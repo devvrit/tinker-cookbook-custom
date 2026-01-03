@@ -52,7 +52,7 @@ Then, based on your analysis and the ground truth, create feedback specifically 
 
 Important guidelines:
 - Do not leak the final answer in your feedback
-- Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid
+- Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid. If multiple valid approaches exist, suggest all of them.
 - Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
 - Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
 
@@ -67,6 +67,55 @@ Feedback: {feedback}
 
 Now solve the problem step by step and write your answer in \\boxed{{}} format.
 """
+
+# =====================
+# Instruct Mode Support
+# =====================
+# For instruct models (like Qwen3-Instruct models) that don't use <think> tags,
+# we use <summary> tags and single-phase generation.
+
+SUMMARY_START_TAG = "<summary>"
+SUMMARY_END_TAG = "</summary>"
+
+DEFAULT_INSTRUCT_STUDENT_SUFFIX = """
+
+Solve this problem step by step. Write your final answer in \\boxed{} format.
+
+After your solution, provide a very thorough and detailed summary of your approach and answer inside <summary> and </summary> tags. The summary should describe in detail each step, calculation, and reasoning you used to solve the problem. Make sure to also include the final answer in \\boxed{} format in this summary."""
+
+DEFAULT_INSTRUCT_FEEDBACK_PROMPT_TEMPLATE = """You are analyzing student attempts at solving a math problem to create helpful feedback for a NEW student who will attempt this problem for the first time.
+
+Problem: {problem}
+Ground Truth Answer: {answer}
+
+Student Solution Summaries:
+{summaries}
+
+First, reason through each student summary carefully. Analyze what each student did correctly and incorrectly. Consider whether different students may have taken valid alternative approaches.
+
+Then, based on your analysis and the ground truth, create feedback specifically designed to help a NEW student who has never seen this problem before. The feedback should:
+1. Warn about common mistakes, misconceptions, and pitfalls to avoid (learned from the attempts above)
+2. Suggest effective problem-solving strategies and key concepts to consider (note: there may be multiple valid solution paths - do not assume only one correct method exists)
+3. Provide hints about important reasoning steps without giving away the solution
+
+Important guidelines:
+- Do not leak the final answer in your feedback
+- Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid
+- Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
+- Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
+
+After your reasoning, provide your final summarized feedback inside <feedback> and </feedback> tags. This feedback will be given directly to a new student, so write it in second person (e.g., "You should consider...") and make it immediately useful for someone approaching this problem fresh.
+"""
+
+DEFAULT_INSTRUCT_PROXY_TEACHER_TEMPLATE = """You are solving a math problem.
+Problem: {problem}
+
+You have received the following feedback from reviewing multiple solution attempts:
+Feedback: {feedback}
+
+Now solve the problem step by step. Write your final answer in \\boxed{{}} format.
+
+After your solution, provide a very thorough and detailed summary of your approach and answer inside <summary> and </summary> tags. The summary should describe in detail each step, calculation, and reasoning you used to solve the problem. Make sure to also include the final answer in \\boxed{{}} format in this summary."""
 
 
 def extract_summary_from_response(response_text: str, filter_incomplete: bool = True) -> str | None:
@@ -95,17 +144,47 @@ def extract_summary_from_response(response_text: str, filter_incomplete: bool = 
     return response_text.strip() if response_text.strip() else None
 
 
+def extract_summary_from_response_instruct(
+    response_text: str,
+    start_tag: str = SUMMARY_START_TAG,
+    end_tag: str = SUMMARY_END_TAG,
+) -> str | None:
+    """
+    Extract the summary from inside <summary>...</summary> tags.
+    
+    For instruct models that don't use <think> tags.
+    
+    Args:
+        response_text: Full response text from the model
+        start_tag: Opening tag for summary (default: <summary>)
+        end_tag: Closing tag for summary (default: </summary>)
+        
+    Returns:
+        The summary text inside the tags, or None if start tag not found
+    """
+    start_idx = response_text.find(start_tag)
+    end_idx = response_text.find(end_tag)
+    
+    if start_idx == -1:
+        # Start tag not found, no summary available
+        return None
+    elif end_idx == -1:
+        # Start tag found but end tag missing, return everything after start tag
+        summary = response_text[start_idx + len(start_tag):].strip()
+        return summary if summary else None
+    else:
+        # Both tags found, return content between them
+        summary = response_text[start_idx + len(start_tag):end_idx].strip()
+        return summary if summary else None
+
+
 class FeedbackSelfDistillationEnv(ProblemEnv):
     """
-    Environment for feedback-based self-distillation with two-step generation:
+    Environment for feedback-based self-distillation.
     
-    Step 1: Generate thinking until </think> token (stop sequence)
-    Step 2: Generate the answer until EOS
-            - If </think> was found in step 1: continue from step 1 tokens
-            - If </think> was NOT found: append continuation text then continue
-    
-    Following the multi-turn RL pattern, step() always returns episode_done=False
-    after step 1 to proceed to step 2 for answer generation.
+    Supports two modes:
+    - Base model mode (use_instruct_mode=False): Two-step generation with </think> stop token
+    - Instruct mode (use_instruct_mode=True): Single-phase generation with EOS stop
     
     The environment returns zero reward since training signal comes from KL only.
     """
@@ -123,6 +202,7 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         think_continuation_text: str = DEFAULT_THINK_CONTINUATION_TEXT,
         max_tokens_turn1: int | None = None,
         max_tokens_turn2: int | None = None,
+        use_instruct_mode: bool = False,
     ):
         # Set format_coef to 0 since we don't use format rewards
         super().__init__(renderer, convo_prefix, format_coef=0.0)
@@ -135,8 +215,9 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         self.think_continuation_text = think_continuation_text
         self.max_tokens_turn1 = max_tokens_turn1
         self.max_tokens_turn2 = max_tokens_turn2
+        self.use_instruct_mode = use_instruct_mode
         
-        # Two-step generation state
+        # Two-step generation state (not used in instruct mode)
         self._step_count: int = 0
         self._step1_action_tokens: list[int] = []  # Store step 1 tokens for building step 2 observation
         self._initial_observation: tinker.ModelInput | None = None  # Store initial obs for step 2
@@ -166,15 +247,23 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
 
     async def initial_observation(self) -> tuple[tinker.ModelInput, list[int]]:
         """
-        Returns initial observation for step 1 with </think> as stop sequence.
-        Step 1 generates thinking and stops at </think> or max_tokens.
+        Returns initial observation.
+        
+        For base models: uses </think> as stop sequence (two-phase generation)
+        For instruct models: uses EOS as stop sequence (single-phase generation)
         """
         convo = self.convo_prefix + [
             {"role": "user", "content": self.get_question()},
         ]
         self._initial_observation = self.renderer.build_generation_prompt(convo)
         self._step_count = 0
-        return self._initial_observation, self._get_step1_stop_condition()
+        
+        if self.use_instruct_mode:
+            # Instruct mode: single-phase, stop at EOS
+            return self._initial_observation, self._get_step2_stop_condition()
+        else:
+            # Base model mode: two-phase, stop at </think> first
+            return self._initial_observation, self._get_step1_stop_condition()
 
     def get_feedback_prompt(self, summaries_text: str) -> str:
         """Returns the feedback prompt with summaries filled in."""
@@ -219,17 +308,36 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
 
     async def step(self, action: Action) -> StepResult:
         """
-        Two-step generation logic following multi-turn RL pattern:
+        Generation logic.
         
-        Step 1: Generate thinking (stops at </think> or max_tokens)
-                - If </think> found: proceed to step 2 with current context
-                - If </think> NOT found: proceed to step 2 with continuation text appended
-        Step 2: Generate answer (stops at EOS), always episode_done=True
+        In instruct mode: Single-phase generation, episode_done=True after step 1.
+        In base model mode: Two-step generation with </think> stop.
         """
         self._step_count += 1
         message, parse_success = self.renderer.parse_response(action)
         response_text = message["content"]
         
+        # Instruct mode: single-phase generation
+        if self.use_instruct_mode:
+            # Episode completes in a single step
+            answer_text = response_text.strip()
+            correct_format = float(self.check_format(answer_text))
+            correct_answer = float(self.check_answer(answer_text))
+            total_reward = self.format_coef * (correct_format - 1) + correct_answer
+            
+            logger.debug(f"Instruct mode: generation complete with {len(action)} tokens, correct={correct_answer}, format={correct_format}")
+            return StepResult(
+                reward=total_reward,
+                episode_done=True,
+                next_observation=tinker.ModelInput.empty(),
+                next_stop_condition=self._get_step2_stop_condition(),
+                metrics={
+                    "correct": correct_answer,
+                    "format": correct_format,
+                },
+            )
+        
+        # Base model mode: two-step generation
         if self._step_count == 1:
             # Step 1: Check for </think> token
             self._step1_action_tokens = list(action)  # Store for step 2
@@ -314,6 +422,7 @@ class FeedbackSelfDistillationDataset(RLDataset):
         max_tokens_turn2: int | None = None,
         seed: int = 0,
         dataset_name: str = "polaris_feedback_selfdistill",
+        use_instruct_mode: bool = False,
     ):
         self.ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train").shuffle(
             seed=seed
@@ -330,6 +439,7 @@ class FeedbackSelfDistillationDataset(RLDataset):
         self.max_tokens_turn1 = max_tokens_turn1
         self.max_tokens_turn2 = max_tokens_turn2
         self.dataset_name = dataset_name
+        self.use_instruct_mode = use_instruct_mode
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         batch_start = index * self.batch_size
@@ -366,6 +476,7 @@ class FeedbackSelfDistillationDataset(RLDataset):
                 think_continuation_text=self.think_continuation_text,
                 max_tokens_turn1=self.max_tokens_turn1,
                 max_tokens_turn2=self.max_tokens_turn2,
+                use_instruct_mode=self.use_instruct_mode,
             ),
             num_envs=group_size,
             dataset_name=self.dataset_name,
@@ -388,6 +499,7 @@ class FeedbackSelfDistillationDatasetBuilder(RLDatasetBuilder):
     max_tokens_turn1: int | None = None  # Max tokens for thinking phase (turn 1)
     max_tokens_turn2: int | None = None  # Max tokens for answer phase (turn 2)
     seed: int = 0
+    use_instruct_mode: bool = False  # Single-phase generation for instruct models
 
     async def __call__(self) -> tuple[FeedbackSelfDistillationDataset, None]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
@@ -406,6 +518,7 @@ class FeedbackSelfDistillationDatasetBuilder(RLDatasetBuilder):
             max_tokens_turn1=self.max_tokens_turn1,
             max_tokens_turn2=self.max_tokens_turn2,
             seed=self.seed,
+            use_instruct_mode=self.use_instruct_mode,
         )
 
         # No test dataset for now

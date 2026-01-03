@@ -78,7 +78,7 @@ DEFAULT_INSTRUCT_STUDENT_SUFFIX = """
 
 Solve this problem step by step. Write your final answer in \\boxed{} format.
 
-After your solution, provide a brief summary of your approach inside <summary> and </summary> tags. The summary should describe the key steps and reasoning you used to solve the problem."""
+After your solution, provide a very thorough and detailed summary of your approach and answer inside <summary> and </summary> tags. The summary should describe in detail each step, calculation, and reasoning you used to solve the problem. Make sure to also include the final answer in \\boxed{} format in this summary."""
 
 DEFAULT_INSTRUCT_FEEDBACK_PROMPT_TEMPLATE = """You are analyzing student attempts at solving a math problem to create helpful feedback for a NEW student who will attempt this problem for the first time.
 
@@ -112,7 +112,7 @@ Feedback: {feedback}
 
 Now solve the problem step by step. Write your final answer in \\boxed{{}} format.
 
-After your solution, provide a brief summary of your approach inside <summary> and </summary> tags."""
+After your solution, provide a very thorough and detailed summary of your approach and answer inside <summary> and </summary> tags. The summary should describe in detail each step, calculation, and reasoning you used to solve the problem. Make sure to also include the final answer in \\boxed{{}} format in this summary."""
 
 
 def extract_summary_from_response_instruct(

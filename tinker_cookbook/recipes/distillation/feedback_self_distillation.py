@@ -42,6 +42,9 @@ from tinker_cookbook.distillation.feedback_self_distillation_datasets import (
     DEFAULT_FEEDBACK_PROMPT_TEMPLATE,
     DEFAULT_PROXY_TEACHER_TEMPLATE,
     DEFAULT_THINK_CONTINUATION_TEXT,
+    # Instruct mode defaults
+    DEFAULT_INSTRUCT_STUDENT_SUFFIX,
+    DEFAULT_INSTRUCT_PROXY_TEACHER_TEMPLATE,
 )
 from tinker_cookbook.recipes.distillation.rl_math_evaluator import RLMathEvaluatorBuilder
 
@@ -111,6 +114,9 @@ class CLIConfig:
     # Service configuration
     base_url: str | None = None
 
+    # Instruct mode (single-phase generation with <summary> tags)
+    use_instruct_mode: bool = False
+
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
 
 
@@ -140,21 +146,42 @@ async def cli_main(cli_config: CLIConfig):
     else:
         wandb_name = os.path.basename(log_path)
 
+    # Select prompts based on mode
+    if cli_config.use_instruct_mode:
+        # Override prompts if not explicitly set and using instruct mode
+        student_suffix = (
+            cli_config.student_prompt_suffix 
+            if cli_config.student_prompt_suffix != DEFAULT_STUDENT_SUFFIX 
+            else DEFAULT_INSTRUCT_STUDENT_SUFFIX
+        )
+        proxy_template = (
+            cli_config.proxy_teacher_template 
+            if cli_config.proxy_teacher_template != DEFAULT_PROXY_TEACHER_TEMPLATE 
+            else DEFAULT_INSTRUCT_PROXY_TEACHER_TEMPLATE
+        )
+    else:
+        student_suffix = cli_config.student_prompt_suffix
+        proxy_template = cli_config.proxy_teacher_template
+
     # Create dataset builder
     dataset_builder = FeedbackSelfDistillationDatasetBuilder(
         groups_per_batch=cli_config.groups_per_batch,
         group_size=cli_config.group_size,
         model_name_for_tokenizer=cli_config.model_name,
         renderer_name=renderer_name,
-        student_prompt_suffix=cli_config.student_prompt_suffix,
+        student_prompt_suffix=student_suffix,
         feedback_prompt_template=cli_config.feedback_prompt_template,
-        proxy_teacher_template=cli_config.proxy_teacher_template,
+        proxy_teacher_template=proxy_template,
         max_tokens_turn1=cli_config.max_tokens_turn1,
         max_tokens_turn2=cli_config.max_tokens_turn2,
         seed=cli_config.seed,
+        use_instruct_mode=cli_config.use_instruct_mode,
     )
 
     # Build infrequent evaluators (AIME24, AIME25)
+    # In instruct mode, use single-step generation (no </think> stop)
+    use_two_step_eval = not cli_config.use_instruct_mode
+    
     infrequent_evaluator_builders = []
     if cli_config.eval_aime24:
         infrequent_evaluator_builders.append(
@@ -163,13 +190,14 @@ async def cli_main(cli_config: CLIConfig):
                 split="train",
                 temperature=0.6,
                 max_tokens=cli_config.max_tokens,
-                use_two_step_generation=True,
+                use_two_step_generation=use_two_step_eval,
                 max_tokens_turn1=cli_config.max_tokens_turn1,
                 max_tokens_turn2=cli_config.max_tokens_turn2,
                 think_continuation_text=DEFAULT_THINK_CONTINUATION_TEXT,
                 n_samples=4,
                 renderer_name=renderer_name,
                 model_name=cli_config.model_name,
+                student_prompt_suffix=student_suffix,
             )
         )
 
@@ -180,13 +208,14 @@ async def cli_main(cli_config: CLIConfig):
                 split="test",
                 temperature=0.6,
                 max_tokens=cli_config.max_tokens,
-                use_two_step_generation=True,
+                use_two_step_generation=use_two_step_eval,
                 max_tokens_turn1=cli_config.max_tokens_turn1,
                 max_tokens_turn2=cli_config.max_tokens_turn2,
                 think_continuation_text=DEFAULT_THINK_CONTINUATION_TEXT,
                 n_samples=4,
                 renderer_name=renderer_name,
                 model_name=cli_config.model_name,
+                student_prompt_suffix=student_suffix,
             )
         )
 

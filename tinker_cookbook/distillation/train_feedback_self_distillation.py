@@ -29,6 +29,7 @@ from tinker_cookbook.distillation.feedback_self_distillation_datasets import (
     FeedbackSelfDistillationDatasetBuilder,
     FeedbackSelfDistillationEnv,
     extract_summary_from_response,
+    extract_summary_from_response_instruct,
 )
 from tinker_cookbook.eval.evaluators import SamplingClientEvaluator, SamplingClientEvaluatorBuilder
 from tinker_cookbook.rl.data_processing import (
@@ -91,12 +92,18 @@ async def generate_feedback_for_group(
         Generated feedback text, or None if feedback extraction failed
     """
     # Extract summaries from each trajectory
-    # With two-step generation:
+    # Check if first env uses instruct mode
+    use_instruct_mode = envs[0].use_instruct_mode if envs else False
+    
+    # With two-step generation (base model mode):
     #   - Turn 1 (transitions[0]): thinking tokens (up to </think>)
     #   - Turn 2 (transitions[1]): answer tokens (the summary)
     # 
+    # With single-step generation (instruct mode):
+    #   - Turn 1 (transitions[0]): full response with <summary> tags
+    #
     # If 2 turns: turn 2 IS the summary by design
-    # If 1 turn: extract summary using </think> parsing (legacy single-turn mode)
+    # If 1 turn: extract summary using appropriate method
     summaries = []
     for i, trajectory in enumerate(trajectory_group.trajectories_G):
         if not trajectory.transitions:
@@ -107,10 +114,16 @@ async def generate_feedback_for_group(
             turn2_tokens = trajectory.transitions[1].ac.tokens
             summary = tokenizer.decode(turn2_tokens, skip_special_tokens=True).strip()
         else:
-            # Single turn: extract summary after </think>
+            # Single turn: extract summary
             turn1_tokens = trajectory.transitions[0].ac.tokens
             response_text = tokenizer.decode(turn1_tokens, skip_special_tokens=True)
-            summary = extract_summary_from_response(response_text, filter_incomplete_traces)
+            
+            if use_instruct_mode:
+                # Instruct mode: extract from <summary> tags
+                summary = extract_summary_from_response_instruct(response_text)
+            else:
+                # Base model mode: extract after </think>
+                summary = extract_summary_from_response(response_text, filter_incomplete_traces)
         
         if summary:
             summaries.append(f"Student solution {i+1}: {summary}")
