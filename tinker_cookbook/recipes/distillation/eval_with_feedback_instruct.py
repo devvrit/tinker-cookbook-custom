@@ -100,6 +100,7 @@ Important guidelines:
 - Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid
 - Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
 - Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
+- Warn about common mistakes, misconceptions, and pitfalls to avoid.
 
 After your reasoning, provide your final summarized feedback inside <feedback> and </feedback> tags. This feedback will be given directly to a new student, so write it in second person (e.g., "You should consider...") and make it immediately useful for someone approaching this problem fresh.
 """
@@ -205,8 +206,15 @@ async def generate_feedback_instruct(
     feedback_temperature: float,
     use_external_api: bool,
     external_feedback_model: str = "gemini-2.0-flash-lite",
+    max_retries: int = 3,
+    retry_delay_seconds: int = 120,
 ) -> str | None:
-    """Generate feedback based on problem, answer, and student summaries."""
+    """Generate feedback based on problem, answer, and student summaries.
+    
+    Args:
+        max_retries: Maximum number of retry attempts on failure (default: 3)
+        retry_delay_seconds: Delay in seconds between retry attempts (default: 60)
+    """
     if summaries:
         summaries_text = "\n".join(
             [f"Student solution {i+1}: {summary}" for i, summary in enumerate(summaries)]
@@ -221,15 +229,32 @@ async def generate_feedback_instruct(
     )
     
     if use_external_api:
-        feedback_text = await get_external_feedback(
-            feedback_prompt,
-            feedback_temperature=feedback_temperature,
-            feedback_max_tokens=feedback_max_tokens,
-            model=external_feedback_model,
-        )
-        feedback_text = extract_external_feedback(
-            feedback_text, start_tag="<feedback>", end_tag="</feedback>"
-        )
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                feedback_text = await get_external_feedback(
+                    feedback_prompt,
+                    feedback_temperature=feedback_temperature,
+                    feedback_max_tokens=feedback_max_tokens,
+                    model=external_feedback_model,
+                )
+                feedback_text = extract_external_feedback(
+                    feedback_text, start_tag="<feedback>", end_tag="</feedback>"
+                )
+                return feedback_text
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Feedback generation failed (attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {retry_delay_seconds} seconds..."
+                    )
+                    await asyncio.sleep(retry_delay_seconds)
+                else:
+                    logger.error(
+                        f"Feedback generation failed after {max_retries} attempts: {e}"
+                    )
+        return None
     else:
         feedback_convo = [
             {"role": "user", "content": feedback_prompt},

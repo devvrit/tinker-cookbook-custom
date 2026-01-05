@@ -55,6 +55,7 @@ Important guidelines:
 - Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid. If multiple valid approaches exist, suggest all of them.
 - Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
 - Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
+- Warn about common mistakes, misconceptions, and pitfalls to avoid.
 
 After your reasoning, provide your final summarized feedback inside <feedback> and </feedback> tags. This feedback will be given directly to a new student, so write it in second person (e.g., "You should consider...") and make it immediately useful for someone approaching this problem fresh.
 """
@@ -203,6 +204,7 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         max_tokens_turn1: int | None = None,
         max_tokens_turn2: int | None = None,
         use_instruct_mode: bool = False,
+        use_feedback: bool = True,
     ):
         # Set format_coef to 0 since we don't use format rewards
         super().__init__(renderer, convo_prefix, format_coef=0.0)
@@ -216,6 +218,7 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         self.max_tokens_turn1 = max_tokens_turn1
         self.max_tokens_turn2 = max_tokens_turn2
         self.use_instruct_mode = use_instruct_mode
+        self.use_feedback = use_feedback
         
         # Two-step generation state (not used in instruct mode)
         self._step_count: int = 0
@@ -277,8 +280,12 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         """
         Returns the proxy teacher prompt conditioned on generated feedback.
         
-        Must be called after generated_feedback is set.
+        If use_feedback=False, returns the student prompt (same as get_question).
+        Otherwise, must be called after generated_feedback is set.
         """
+        if not self.use_feedback:
+            # No feedback mode: use same prompt as student
+            return self.get_question()
         if self.generated_feedback is None:
             raise ValueError("generated_feedback must be set before calling get_proxy_teacher_prompt")
         return self.proxy_teacher_template.format(
@@ -422,6 +429,7 @@ class FeedbackSelfDistillationDataset(RLDataset):
         max_tokens_turn2: int | None = None,
         seed: int = 0,
         dataset_name: str = "polaris_feedback_selfdistill",
+        use_feedback: bool = True,
         use_instruct_mode: bool = False,
     ):
         self.ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train").shuffle(
@@ -440,6 +448,7 @@ class FeedbackSelfDistillationDataset(RLDataset):
         self.max_tokens_turn2 = max_tokens_turn2
         self.dataset_name = dataset_name
         self.use_instruct_mode = use_instruct_mode
+        self.use_feedback = use_feedback
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         batch_start = index * self.batch_size
@@ -477,6 +486,7 @@ class FeedbackSelfDistillationDataset(RLDataset):
                 max_tokens_turn1=self.max_tokens_turn1,
                 max_tokens_turn2=self.max_tokens_turn2,
                 use_instruct_mode=self.use_instruct_mode,
+                use_feedback=self.use_feedback,
             ),
             num_envs=group_size,
             dataset_name=self.dataset_name,
@@ -500,6 +510,7 @@ class FeedbackSelfDistillationDatasetBuilder(RLDatasetBuilder):
     max_tokens_turn2: int | None = None  # Max tokens for answer phase (turn 2)
     seed: int = 0
     use_instruct_mode: bool = False  # Single-phase generation for instruct models
+    use_feedback: bool = True  # If False, skip feedback generation and use student prompt for teacher
 
     async def __call__(self) -> tuple[FeedbackSelfDistillationDataset, None]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
@@ -519,6 +530,7 @@ class FeedbackSelfDistillationDatasetBuilder(RLDatasetBuilder):
             max_tokens_turn2=self.max_tokens_turn2,
             seed=self.seed,
             use_instruct_mode=self.use_instruct_mode,
+            use_feedback=self.use_feedback,
         )
 
         # No test dataset for now

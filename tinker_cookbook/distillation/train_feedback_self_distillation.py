@@ -327,6 +327,7 @@ class Config:
 
     wandb_project: str | None = None
     wandb_name: str | None = None
+    use_feedback: bool = True  # If False, skip feedback generation and use student prompt for teacher
     use_external_api: bool = False
     external_feedback_model: str = "gemini-2.0-flash-lite"  # Model to use for external feedback API
 
@@ -547,42 +548,50 @@ async def do_sync_training(
             for i, trajectory in enumerate(trajectory_groups_P[0].trajectories_G[:2]):
                 logger.info(format_trajectory(trajectory, tokenizer, preview=cfg.preview_trajectories, label=f"Traj {i}"))
 
-        # Phase 2: Generate feedback for each group
-        with timed("generate_feedback", metrics):
-            feedback_tasks = []
-            for envs, trajectory_group in zip(env_groups_P, trajectory_groups_P, strict=True):
-                task = generate_feedback_for_group(
-                    feedback_sampling_client,
-                    renderer,
-                    envs,
-                    trajectory_group,
-                    tokenizer,
-                    cfg.filter_incomplete_traces,
-                    cfg.feedback_max_tokens,
-                    cfg.feedback_temperature,
-                    use_external_api=cfg.use_external_api,
-                    external_feedback_model=cfg.external_feedback_model,
-                )
-                feedback_tasks.append(task)
-            
-            # Generate all feedbacks in parallel
-            feedbacks = await asyncio.gather(*feedback_tasks)
+        # Phase 2: Generate feedback for each group (skip if use_feedback=False)
+        if cfg.use_feedback:
+            with timed("generate_feedback", metrics):
+                feedback_tasks = []
+                for envs, trajectory_group in zip(env_groups_P, trajectory_groups_P, strict=True):
+                    task = generate_feedback_for_group(
+                        feedback_sampling_client,
+                        renderer,
+                        envs,
+                        trajectory_group,
+                        tokenizer,
+                        cfg.filter_incomplete_traces,
+                        cfg.feedback_max_tokens,
+                        cfg.feedback_temperature,
+                        use_external_api=cfg.use_external_api,
+                        external_feedback_model=cfg.external_feedback_model,
+                    )
+                    feedback_tasks.append(task)
+                
+                # Generate all feedbacks in parallel
+                feedbacks = await asyncio.gather(*feedback_tasks)
 
-            for idx, fb in enumerate(feedbacks[:2]):
-                logger.info(f"Feedback {idx}: {format_text(fb, cfg.preview_feedback) if fb else '(empty)'}")
-            
-            # Set feedback on all envs in each group
-            for envs, feedback in zip(env_groups_P, feedbacks, strict=True):
+                for idx, fb in enumerate(feedbacks[:2]):
+                    logger.info(f"Feedback {idx}: {format_text(fb, cfg.preview_feedback) if fb else '(empty)'}")
+                
+                # Set feedback on all envs in each group
+                for envs, feedback in zip(env_groups_P, feedbacks, strict=True):
+                    for env in envs:
+                        env.generated_feedback = feedback
+                
+                # Compute feedback metrics
+                if feedbacks:
+                    # Filter out None feedbacks when computing average length
+                    valid_feedbacks = [f for f in feedbacks if f is not None]
+                    if valid_feedbacks:
+                        metrics["feedback/length"] = sum(len(f) for f in valid_feedbacks) / len(valid_feedbacks)
+        else:
+            # No feedback mode: set feedback to None for all envs
+            # (proxy teacher will use student prompt via get_proxy_teacher_prompt)
+            logger.info("Skipping feedback generation (use_feedback=False)")
+            for envs in env_groups_P:
                 for env in envs:
-                    env.generated_feedback = feedback
+                    env.generated_feedback = None
             
-            # Compute feedback metrics
-            if feedbacks:
-                # Filter out None feedbacks when computing average length
-                valid_feedbacks = [f for f in feedbacks if f is not None]
-                if valid_feedbacks:
-                    metrics["feedback/length"] = sum(len(f) for f in valid_feedbacks) / len(valid_feedbacks)
-
         # Phase 3: Train step (now envs have feedback set)
         sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
             cfg,

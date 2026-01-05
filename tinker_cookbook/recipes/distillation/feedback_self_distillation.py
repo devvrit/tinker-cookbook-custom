@@ -117,6 +117,9 @@ class CLIConfig:
     # Instruct mode (single-phase generation with <summary> tags)
     use_instruct_mode: bool = False
 
+    # Feedback mode: if False, skip feedback generation and use student prompt for teacher
+    use_feedback: bool = True
+
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
 
 
@@ -176,6 +179,7 @@ async def cli_main(cli_config: CLIConfig):
         max_tokens_turn2=cli_config.max_tokens_turn2,
         seed=cli_config.seed,
         use_instruct_mode=cli_config.use_instruct_mode,
+        use_feedback=cli_config.use_feedback,
     )
 
     # Build infrequent evaluators (AIME24, AIME25)
@@ -253,6 +257,7 @@ async def cli_main(cli_config: CLIConfig):
         preview_trajectories=cli_config.preview_trajectories,
         preview_feedback=cli_config.preview_feedback,
         preview_proxy_teacher_prompt=cli_config.preview_proxy_teacher_prompt,
+        use_feedback=cli_config.use_feedback,
     )
 
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
