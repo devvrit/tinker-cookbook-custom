@@ -727,20 +727,14 @@ async def main(config: CLIConfig):
     
     # Auto-detect base model from checkpoint if not provided
     base_model = config.model_name
-    if config.model_path is not None:
+    if config.model_path is not None and base_model is None:
+        # Only fetch training run info if we need to auto-detect base_model
         rest_client = service_client.create_rest_client()
         training_run = await rest_client.get_training_run_by_tinker_path_async(
             config.model_path
         )
-        if base_model:
-            if base_model != training_run.base_model:
-                raise ValueError(
-                    f"Provided model_name {base_model} does not match "
-                    f"checkpoint's base model {training_run.base_model}"
-                )
-        else:
-            base_model = training_run.base_model
-            logger.info(f"Auto-detected base model from checkpoint: {base_model}")
+        base_model = training_run.base_model
+        logger.info(f"Auto-detected base model from checkpoint: {base_model}")
     
     if base_model is None:
         raise ValueError("Could not determine base model. Please provide model_name.")

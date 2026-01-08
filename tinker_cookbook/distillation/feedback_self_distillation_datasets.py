@@ -101,9 +101,10 @@ Then, based on your analysis and the ground truth, create feedback specifically 
 
 Important guidelines:
 - Do not leak the final answer in your feedback
-- Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid
+- Be aware that multiple correct approaches may exist - avoid insisting on a single "correct" method if alternatives are valid. If multiple valid approaches exist, suggest all of them.
 - Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
 - Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
+- Warn about common mistakes, misconceptions, and pitfalls to avoid.
 
 After your reasoning, provide your final summarized feedback inside <feedback> and </feedback> tags. This feedback will be given directly to a new student, so write it in second person (e.g., "You should consider...") and make it immediately useful for someone approaching this problem fresh.
 """
@@ -321,8 +322,17 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         In base model mode: Two-step generation with </think> stop.
         """
         self._step_count += 1
-        message, parse_success = self.renderer.parse_response(action)
-        response_text = message["content"]
+        
+        # For step 1 of base model mode, we use </think> as stop token, not the renderer's
+        # stop token (e.g., <|im_end|>). So we decode directly instead of using parse_response,
+        # which would fail because it expects the renderer's stop token.
+        if not self.use_instruct_mode and self._step_count == 1:
+            # Step 1: decode tokens directly (stop token was </think>)
+            response_text = self.tokenizer.decode(action)
+        else:
+            # Instruct mode or step 2: use renderer's parse_response
+            message, parse_success = self.renderer.parse_response(action)
+            response_text = message["content"]
         
         # Instruct mode: single-phase generation
         if self.use_instruct_mode:

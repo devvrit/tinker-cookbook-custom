@@ -115,6 +115,45 @@ Now solve the problem step by step. Write your final answer in \\boxed{{}} forma
 
 After your solution, provide a very thorough and detailed summary of your approach and answer inside <summary> and </summary> tags. The summary should describe in detail each step, calculation, and reasoning you used to solve the problem. Make sure to also include the final answer in \\boxed{{}} format in this summary."""
 
+# LogiQA prompt templates (no summary needed - full trace passed to feedback model)
+LOGIQA_STUDENT_SUFFIX = """
+
+Solve this problem step by step. Write your final answer in \\boxed{} format, with just the option number (1, 2, 3, or 4) within \\boxed{}."""
+
+LOGIQA_FEEDBACK_PROMPT_TEMPLATE = """You are analyzing student attempts at solving a logical reasoning problem to create helpful feedback for a NEW student who will attempt this problem for the first time.
+
+Problem:
+{problem}
+
+Ground Truth Answer: Option {answer}
+
+Student Attempts (full responses):
+{summaries}
+
+First, reason through each student attempt carefully. Analyze what each student did correctly and incorrectly. Consider whether different students may have taken valid alternative approaches.
+
+Then, based on your analysis and the ground truth, create feedback specifically designed to help a NEW student who has never seen this problem before. The feedback should:
+1. Warn about common mistakes, misconceptions, and pitfalls to avoid (learned from the attempts above)
+2. Suggest effective problem-solving strategies and key concepts to consider
+3. Provide hints about important reasoning steps without giving away the answer
+
+Important guidelines:
+- Do not leak the final answer in your feedback
+- Write the feedback as actionable guidance that will help a first-time solver improve their problem-solving process
+- Frame the feedback as forward-looking advice (e.g., "Consider...", "Watch out for...", "A useful approach is...") rather than commentary on past attempts
+- Warn about common mistakes, misconceptions, and pitfalls to avoid.
+
+After your reasoning, provide your final summarized feedback inside <feedback> and </feedback> tags.
+"""
+
+LOGIQA_PROXY_TEACHER_TEMPLATE = """{problem}
+
+You have received the following feedback from reviewing multiple solution attempts:
+Feedback: {feedback}
+
+Now solve the problem step by step. Write your final answer in \\boxed{{}} format, with just the option number (1, 2, 3, or 4) within \\boxed{{}}."""
+
+
 
 def extract_summary_from_response_instruct(
     response_text: str,
@@ -160,6 +199,7 @@ class CLIConfig:
     # Dataset configuration
     eval_aime24: bool = False
     eval_aime25: bool = False
+    eval_logiqa: bool = False  # lucasmccabe/logiqa logical reasoning dataset
     max_problems: int | None = None  # Limit number of problems to evaluate (takes first N problems)
     start_idx: int | None = None  # Start index for subset evaluation (0-based)
     end_idx: int | None = None  # End index for subset evaluation (exclusive, if None uses all after start_idx)
@@ -348,19 +388,25 @@ async def evaluate_dataset_combined(
     preview_responses: bool = True,
     preview_feedback: bool = True,
     max_trajectories_to_log: int = 5,
+    dataset_type: str = "aime",  # "aime" or "logiqa"
 ) -> dict[str, float]:
     """
     Efficiently evaluate a dataset with both baseline and feedback-conditioned generation.
     
     For instruct models (single-phase generation):
-    1. Generate baseline samples with prompt asking for summary in <summary> tags
-    2. Grade baseline samples and extract summaries
-    3. Generate feedback from those summaries
+    1. Generate baseline samples with prompt asking for summary in <summary> tags (AIME) or just answer (LogiQA)
+    2. Grade baseline samples and extract summaries (AIME) or full responses (LogiQA)
+    3. Generate feedback from those summaries/responses
     4. Generate feedback-conditioned samples (single phase)
     5. Grade feedback-conditioned samples
     """
     logger.info(f"Loading dataset: {dataset_name} (split: {split})")
-    dataset = load_dataset(dataset_name, split=split)
+    if dataset_type == "logiqa":
+        # Load LogiQA from Parquet files (the loading script is deprecated)
+        parquet_url = f"https://huggingface.co/datasets/{dataset_name}/resolve/refs%2Fconvert%2Fparquet/default/{split}/0000.parquet"
+        dataset = load_dataset("parquet", data_files=parquet_url, split="train")
+    else:
+        dataset = load_dataset(dataset_name, split=split)
     total_size = len(dataset)
     logger.info(f"Dataset has {total_size} total problems")
     
@@ -394,7 +440,19 @@ async def evaluate_dataset_combined(
     references = []
     
     for sample in dataset:
-        if "Problem" in sample:  # AIME 2024
+        if dataset_type == "logiqa":
+            # LogiQA format: context, query, options, correct_option
+            context = sample["context"]
+            query = sample["query"]
+            options = sample["options"]
+            correct_option = sample["correct_option"]  # 0-indexed
+            
+            # Format problem with numbered options
+            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)])
+            problem = f"Context: {context}\n\n{query}\n\nOptions:\n{options_text}"
+            # Store 1-indexed answer for display and grading
+            answer = str(correct_option + 1)
+        elif "Problem" in sample:  # AIME 2024
             problem = sample["Problem"]
             answer = str(sample["Answer"])
         elif "problem" in sample:  # AIME 2025
@@ -429,14 +487,14 @@ async def evaluate_dataset_combined(
     async def process_problem_combined(idx: int, problem: str, answer: str):
         """
         Process a single problem for instruct models:
-        1. Generate baseline samples with summary prompt
-        2. Extract summaries from <summary> tags
+        1. Generate baseline samples with summary prompt (AIME) or simple prompt (LogiQA)
+        2. Extract summaries from <summary> tags (AIME) or use full responses (LogiQA)
         3. Generate feedback
         4. Generate feedback-conditioned samples
         
         Returns both baseline and feedback results.
         """
-        # Build prompt with suffix asking for summary
+        # Build prompt with suffix
         full_prompt = problem + student_prompt_suffix
         prompt_input = renderer.build_generation_prompt(
             [renderers.Message(role="user", content=full_prompt)]
@@ -456,19 +514,25 @@ async def evaluate_dataset_combined(
         )
         
         baseline_tokens_list = []
-        baseline_summaries = []
+        baseline_summaries = []  # For AIME: extracted summaries; For LogiQA: full responses
         
         for seq in response.sequences:
             tokens = list(seq.tokens)
             baseline_tokens_list.append(tokens)
             
-            # Decode and extract summary from <summary> tags
+            # Decode response
             response_text = tokenizer.decode(tokens, skip_special_tokens=True)
-            summary = extract_summary_from_response_instruct(response_text)
-            if summary:
-                baseline_summaries.append(summary)
+            
+            if dataset_type == "logiqa":
+                # For LogiQA: use full response for feedback (no summary extraction)
+                baseline_summaries.append(response_text)
+            else:
+                # For AIME: extract summary from <summary> tags
+                summary = extract_summary_from_response_instruct(response_text)
+                if summary:
+                    baseline_summaries.append(summary)
         
-        # Generate feedback from baseline summaries
+        # Generate feedback from baseline summaries/responses
         feedback = await generate_feedback_instruct(
             sampling_client,
             renderer,
@@ -500,6 +564,37 @@ async def evaluate_dataset_combined(
         
         return idx, baseline_tokens_list, feedback_tokens_list, answer, feedback, baseline_summaries
     
+    def grade_logiqa_answer(extracted: str, correct_option: str) -> bool:
+        """Grade LogiQA answer by comparing extracted option number to correct option.
+        
+        Args:
+            extracted: The extracted answer (e.g., "1", "2", "Option 1", etc.)
+            correct_option: The correct option as 1-indexed string (e.g., "1", "2", "3", "4")
+        
+        Returns:
+            True if the extracted answer matches the correct option number.
+        """
+        if not extracted:
+            return False
+        
+        # Clean the extracted answer - get just the number
+        extracted_clean = extracted.strip()
+        
+        # Try to extract a number from the response
+        import re
+        # Match patterns like "1", "2", "Option 1", "option 2", "A", "B", etc.
+        number_match = re.search(r'^\s*(\d+)\s*$', extracted_clean)
+        if number_match:
+            return number_match.group(1) == correct_option
+        
+        # Handle letter answers (A=1, B=2, C=3, D=4)
+        letter_map = {'A': '1', 'B': '2', 'C': '3', 'D': '4', 'a': '1', 'b': '2', 'c': '3', 'd': '4'}
+        if extracted_clean in letter_map:
+            return letter_map[extracted_clean] == correct_option
+        
+        # Direct string comparison as fallback
+        return extracted_clean == correct_option
+    
     def grade_samples(tokens_list: list[list[int]], ref: str) -> tuple[int, list[dict]]:
         """Grade a list of token sequences and return (correct_count, sample_results)."""
         correct_count = 0
@@ -512,7 +607,12 @@ async def evaluate_dataset_combined(
             is_correct = False
             try:
                 extracted = extract_boxed(decoded_text)
-                is_correct = grade_answer(extracted, ref)
+                if dataset_type == "logiqa":
+                    # For LogiQA: simple option number matching
+                    is_correct = grade_logiqa_answer(extracted, ref)
+                else:
+                    # For AIME: use math grading
+                    is_correct = grade_answer(extracted, ref)
                 if is_correct:
                     correct_count += 1
             except Exception:
@@ -777,22 +877,38 @@ async def main(config: CLIConfig):
     all_metrics = {}
     
     # Evaluate each dataset with combined baseline + feedback evaluation
+    # Each entry is (dataset_name, split, dataset_type)
     datasets_to_eval = []
     if config.eval_aime24:
-        datasets_to_eval.append(("Maxwell-Jia/AIME_2024", "train"))
+        datasets_to_eval.append(("Maxwell-Jia/AIME_2024", "train", "aime-24"))
     if config.eval_aime25:
-        datasets_to_eval.append(("math-ai/aime25", "test"))
+        datasets_to_eval.append(("math-ai/aime25", "test", "aime-25"))
+    if config.eval_logiqa:
+        datasets_to_eval.append(("lucasmccabe/logiqa", "test", "logiqa"))
     
     if not datasets_to_eval:
         raise ValueError(
-            "No evaluations specified. Use eval_aime24=True or eval_aime25=True"
+            "No evaluations specified. Use eval_aime24=True, eval_aime25=True, or eval_logiqa=True"
         )
     
-    for dataset_name, split in datasets_to_eval:
+    for dataset_name, split, dataset_type in datasets_to_eval:
         logger.info(f"\n{'='*80}")
         logger.info(f"Evaluating {dataset_name} - INSTRUCT MODEL (single-phase generation)")
-        logger.info(f"Baseline samples will be reused for summary extraction and feedback")
+        if dataset_type == "logiqa":
+            logger.info(f"Full responses will be used for feedback (no summary extraction)")
+        else:
+            logger.info(f"Baseline samples will be reused for summary extraction and feedback")
         logger.info(f"{'='*80}")
+        
+        # Select dataset-specific templates
+        if dataset_type == "logiqa":
+            student_suffix = LOGIQA_STUDENT_SUFFIX
+            feedback_template = LOGIQA_FEEDBACK_PROMPT_TEMPLATE
+            proxy_template = LOGIQA_PROXY_TEACHER_TEMPLATE
+        else:
+            student_suffix = config.student_prompt_suffix
+            feedback_template = config.feedback_prompt_template
+            proxy_template = config.proxy_teacher_template
         
         # Combined evaluation: baseline samples are reused for feedback
         dataset_metrics = {}
@@ -810,9 +926,9 @@ async def main(config: CLIConfig):
                 config.temperature,
                 config.max_tokens,
                 config.n_samples,
-                student_prompt_suffix=config.student_prompt_suffix,
-                feedback_prompt_template=config.feedback_prompt_template,
-                proxy_teacher_template=config.proxy_teacher_template,
+                student_prompt_suffix=student_suffix,
+                feedback_prompt_template=feedback_template,
+                proxy_teacher_template=proxy_template,
                 feedback_max_tokens=config.feedback_max_tokens,
                 feedback_temperature=config.feedback_temperature,
                 use_external_api=config.use_external_api,
@@ -822,6 +938,7 @@ async def main(config: CLIConfig):
                 preview_responses=config.preview_responses,
                 preview_feedback=config.preview_feedback,
                 max_trajectories_to_log=config.max_trajectories_to_log,
+                dataset_type=dataset_type,
             )
         all_metrics.update(combined_metrics)
         all_metrics.update(dataset_metrics)
